@@ -20,7 +20,7 @@ RUNTIME_DIR = VOLUMES_DIR.joinpath("runtime")
 SCREENSHOTS_DIR = VOLUMES_DIR.joinpath("screenshots")
 RECORD_DIR = VOLUMES_DIR.joinpath("record")
 HCAPTCHA_DIR = VOLUMES_DIR.joinpath("hcaptcha")
-DEFAULT_GEMINI_BASE_URL = "https://aihubmix.com"
+DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com"
 
 
 def _normalize_gemini_base_url(base_url: str) -> str:
@@ -65,7 +65,7 @@ class EpicSettings(AgentConfig):
     )
     
     GEMINI_MODEL: str = Field(
-        default=os.getenv("GEMINI_MODEL", "gemini-2.5-pro"),
+        default=os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
         description="模型名称",
     )
 
