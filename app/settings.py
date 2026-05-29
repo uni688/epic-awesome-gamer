@@ -3,6 +3,7 @@ import os
 import sys
 import asyncio
 from pathlib import Path
+from urllib.parse import urlparse
 
 # === 引入所需库 ===
 from hcaptcha_challenger.agent import AgentConfig
@@ -19,6 +20,34 @@ RUNTIME_DIR = VOLUMES_DIR.joinpath("runtime")
 SCREENSHOTS_DIR = VOLUMES_DIR.joinpath("screenshots")
 RECORD_DIR = VOLUMES_DIR.joinpath("record")
 HCAPTCHA_DIR = VOLUMES_DIR.joinpath("hcaptcha")
+DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com"
+
+
+def _normalize_gemini_base_url(base_url: str) -> str:
+    candidate = (base_url or "").strip()
+    if not candidate:
+        logger.warning("⚠️ GEMINI_BASE_URL 为空，回退到默认地址")
+        candidate = DEFAULT_GEMINI_BASE_URL
+    elif candidate.startswith("/"):
+        logger.warning(f"⚠️ GEMINI_BASE_URL 是相对路径 `{candidate}`，自动补全为绝对地址")
+        candidate = f"{DEFAULT_GEMINI_BASE_URL}{candidate}"
+    elif not candidate.startswith(("http://", "https://")):
+        logger.warning(f"⚠️ GEMINI_BASE_URL 缺少协议 `{candidate}`，自动补全为 https://")
+        candidate = f"https://{candidate.lstrip('/')}"
+
+    parsed = urlparse(candidate)
+    if not parsed.scheme or not parsed.netloc:
+        logger.warning(
+            f"⚠️ GEMINI_BASE_URL 无效 `{candidate}`，回退到默认地址 {DEFAULT_GEMINI_BASE_URL}"
+        )
+        candidate = DEFAULT_GEMINI_BASE_URL
+
+    candidate = candidate.rstrip("/")
+    if candidate.endswith("/v1"):
+        candidate = candidate[:-3]
+    if not candidate.endswith("/gemini"):
+        candidate = f"{candidate}/gemini"
+    return candidate
 
 # === 配置类定义 ===
 class EpicSettings(AgentConfig):
@@ -31,12 +60,12 @@ class EpicSettings(AgentConfig):
     )
     
     GEMINI_BASE_URL: str = Field(
-        default=os.getenv("GEMINI_BASE_URL", "https://aihubmix.com"),
+        default=os.getenv("GEMINI_BASE_URL", DEFAULT_GEMINI_BASE_URL),
         description="中转地址",
     )
     
     GEMINI_MODEL: str = Field(
-        default=os.getenv("GEMINI_MODEL", "gemini-2.5-pro"),
+        default=os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
         description="模型名称",
     )
 
@@ -85,9 +114,7 @@ def _apply_aihubmix_patch():
             
             kwargs['api_key'] = api_key
             
-            base_url = settings.GEMINI_BASE_URL.rstrip('/')
-            if base_url.endswith('/v1'): base_url = base_url[:-3]
-            if not base_url.endswith('/gemini'): base_url = f"{base_url}/gemini"
+            base_url = _normalize_gemini_base_url(settings.GEMINI_BASE_URL)
             
             kwargs['http_options'] = types.HttpOptions(base_url=base_url)
             logger.info(f"🚀 AiHubMix 补丁已应用 | 模型: {settings.GEMINI_MODEL} | 地址: {base_url}")
