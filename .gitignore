@@ -137,3 +137,5 @@ tmp/
 docker/volumes
 user_data
 app/volumes
+
+.bin
