@@ -25,6 +25,11 @@ HCAPTCHA_DIR = VOLUMES_DIR.joinpath("hcaptcha")
 class EpicSettings(AgentConfig):
     model_config = SettingsConfigDict(env_file=".env", env_ignore_empty=True, extra="ignore")
 
+    GEMINI_BASE_URL: str = Field(
+        default=os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com"),
+        description="Gemini API Base URL",
+    )
+
     GEMINI_API_KEY: SecretStr | None = Field(
         default_factory=lambda: os.getenv("GEMINI_API_KEY"),
         description="Gemini API Key",
@@ -33,6 +38,34 @@ class EpicSettings(AgentConfig):
     GEMINI_MODEL: str = Field(
         default=os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
         description="模型名称",
+    )
+
+    CHALLENGE_CLASSIFIER_MODEL: str = Field(
+        default_factory=lambda: os.getenv(
+            "CHALLENGE_CLASSIFIER_MODEL", os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+        ),
+        description="挑战分类模型名称",
+    )
+
+    IMAGE_CLASSIFIER_MODEL: str = Field(
+        default_factory=lambda: os.getenv(
+            "IMAGE_CLASSIFIER_MODEL", os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+        ),
+        description="图像分类模型名称",
+    )
+
+    SPATIAL_POINT_REASONER_MODEL: str = Field(
+        default_factory=lambda: os.getenv(
+            "SPATIAL_POINT_REASONER_MODEL", os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+        ),
+        description="空间点推理模型名称",
+    )
+
+    SPATIAL_PATH_REASONER_MODEL: str = Field(
+        default_factory=lambda: os.getenv(
+            "SPATIAL_PATH_REASONER_MODEL", os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+        ),
+        description="空间路径推理模型名称",
     )
 
     EPIC_EMAIL: str = Field(default_factory=lambda: os.getenv("EPIC_EMAIL"))
@@ -58,4 +91,3 @@ class EpicSettings(AgentConfig):
 
 settings = EpicSettings()
 settings.ignore_request_questions = ["Please drag the crossing to complete the lines"]
-

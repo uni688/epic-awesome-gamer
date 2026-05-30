@@ -122,7 +122,8 @@ Provide the commit message as a single JSON object, following the rules and form
 """
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-MODEL_NAME = os.getenv("MODEL_NAME", "gemini-2.5-flash")
+GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
 # Maximum context length (number of characters), 40k
 MAX_CONTEXT_LENGTH = 40960
@@ -183,7 +184,9 @@ class GitCommitGenerator:
         self.max_context = max_context
         self.auto_push = auto_push
 
-        self._client = genai.Client(api_key=GEMINI_API_KEY)
+        self._client = genai.Client(
+            api_key=GEMINI_API_KEY, http_options=types.HttpOptions(base_url=GEMINI_BASE_URL)
+        )
         self._model = MODEL_NAME
 
         logger.debug(f"GitCommitGenerator initialized for repository: {self.repo_path}")
