@@ -77,3 +77,4 @@ tmp/
 app/tmp/
 
 bin/
+.secrets
