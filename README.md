@@ -65,6 +65,9 @@
 | 变量名 | 默认值 | 说明 |
 | :--- | :--- | :--- |
 | `GEMINI_MODEL` | `gemini-3.5-flash` | 推荐使用 3.5 Flash |
+| `GEMINI_BASE_URL` | `https://generativelanguage.googleapis.com` | Gemini API 地址，留空或未设置时回退到官方地址 |
+
+> `CHALLENGE_CLASSIFIER_MODEL`、`IMAGE_CLASSIFIER_MODEL`、`SPATIAL_POINT_REASONER_MODEL`、`SPATIAL_PATH_REASONER_MODEL` 默认都会跟随 `GEMINI_MODEL`。
 
 ### 4. 启动工作流
 1. 点击仓库上方的 **Actions** 标签页。
@@ -154,4 +157,3 @@ docker compose up -d
 <div align="center">
 <b>Enjoy your free games! 🎮</b>
 </div>
-
