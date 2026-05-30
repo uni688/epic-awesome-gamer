@@ -1,15 +1,11 @@
 # -*- coding: utf-8 -*-
 import os
-import sys
-import asyncio
 from pathlib import Path
-from urllib.parse import urlparse
 
 # === 引入所需库 ===
 from hcaptcha_challenger.agent import AgentConfig
 from pydantic import Field, SecretStr
 from pydantic_settings import SettingsConfigDict
-from loguru import logger
 
 # --- 核心路径定义 ---
 PROJECT_ROOT = Path(__file__).parent
