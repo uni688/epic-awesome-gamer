@@ -20,48 +20,14 @@ RUNTIME_DIR = VOLUMES_DIR.joinpath("runtime")
 SCREENSHOTS_DIR = VOLUMES_DIR.joinpath("screenshots")
 RECORD_DIR = VOLUMES_DIR.joinpath("record")
 HCAPTCHA_DIR = VOLUMES_DIR.joinpath("hcaptcha")
-DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com"
-
-
-def _normalize_gemini_base_url(base_url: str) -> str:
-    candidate = (base_url or "").strip()
-    if not candidate:
-        logger.warning("⚠️ GEMINI_BASE_URL 为空，回退到默认地址")
-        candidate = DEFAULT_GEMINI_BASE_URL
-    elif candidate.startswith("/"):
-        logger.warning(f"⚠️ GEMINI_BASE_URL 是相对路径 `{candidate}`，自动补全为绝对地址")
-        candidate = f"{DEFAULT_GEMINI_BASE_URL}{candidate}"
-    elif not candidate.startswith(("http://", "https://")):
-        logger.warning(f"⚠️ GEMINI_BASE_URL 缺少协议 `{candidate}`，自动补全为 https://")
-        candidate = f"https://{candidate.lstrip('/')}"
-
-    parsed = urlparse(candidate)
-    if not parsed.scheme or not parsed.netloc:
-        logger.warning(
-            f"⚠️ GEMINI_BASE_URL 无效 `{candidate}`，回退到默认地址 {DEFAULT_GEMINI_BASE_URL}"
-        )
-        candidate = DEFAULT_GEMINI_BASE_URL
-
-    candidate = candidate.rstrip("/")
-    if candidate.endswith("/v1"):
-        candidate = candidate[:-3]
-    if not candidate.endswith("/gemini"):
-        candidate = f"{candidate}/gemini"
-    return candidate
 
 # === 配置类定义 ===
 class EpicSettings(AgentConfig):
     model_config = SettingsConfigDict(env_file=".env", env_ignore_empty=True, extra="ignore")
 
-    # [基础配置] AiHubMix 必须使用 SecretStr 类型
     GEMINI_API_KEY: SecretStr | None = Field(
         default_factory=lambda: os.getenv("GEMINI_API_KEY"),
-        description="AiHubMix 的令牌",
-    )
-    
-    GEMINI_BASE_URL: str = Field(
-        default=os.getenv("GEMINI_BASE_URL", DEFAULT_GEMINI_BASE_URL),
-        description="中转地址",
+        description="Gemini API Key",
     )
     
     GEMINI_MODEL: str = Field(
@@ -93,81 +59,3 @@ class EpicSettings(AgentConfig):
 settings = EpicSettings()
 settings.ignore_request_questions = ["Please drag the crossing to complete the lines"]
 
-# ==========================================
-# [方案一修复版] AiHubMix 终极补丁
-# ==========================================
-def _apply_aihubmix_patch():
-    if not settings.GEMINI_API_KEY:
-        return
-
-    try:
-        from google import genai
-        from google.genai import types
-        
-        # 1. 劫持 Client 初始化 (自动修正中转路径)
-        orig_init = genai.Client.__init__
-        def new_init(self, *args, **kwargs):
-            if hasattr(settings.GEMINI_API_KEY, 'get_secret_value'):
-                api_key = settings.GEMINI_API_KEY.get_secret_value()
-            else:
-                api_key = str(settings.GEMINI_API_KEY)
-            
-            kwargs['api_key'] = api_key
-            
-            base_url = _normalize_gemini_base_url(settings.GEMINI_BASE_URL)
-            
-            kwargs['http_options'] = types.HttpOptions(base_url=base_url)
-            logger.info(f"🚀 AiHubMix 补丁已应用 | 模型: {settings.GEMINI_MODEL} | 地址: {base_url}")
-            orig_init(self, *args, **kwargs)
-        
-        genai.Client.__init__ = new_init
-
-        # 2. 劫持文件上传 (绕过 400/403 错误，并修复 TypeError)
-        try:
-            file_cache = {}
-
-            # 自定义 helper，避免依赖 google 内部库
-            def _local_to_list(c):
-                return c if isinstance(c, list) else [c]
-
-            async def patched_upload(self_files, file, **kwargs):
-                if hasattr(file, 'read'): content = file.read()
-                elif isinstance(file, (str, Path)):
-                    with open(file, 'rb') as f: content = f.read()
-                else: content = bytes(file)
-                
-                if asyncio.iscoroutine(content): content = await content
-                
-                # 伪造文件上传，实际只存内存
-                file_id = f"bypass_{id(content)}"
-                file_cache[file_id] = content
-                return types.File(name=file_id, uri=file_id, mime_type="image/png")
-
-            orig_generate = genai.models.AsyncModels.generate_content
-            async def patched_generate(self_models, model, contents, **kwargs):
-                normalized = _local_to_list(contents)
-                
-                for content in normalized:
-                    if hasattr(content, 'parts'):
-                        for i, part in enumerate(content.parts):
-                            # 如果发现是我们伪造的文件 ID，立马替换成 Base64
-                            if part.file_data and part.file_data.file_uri in file_cache:
-                                data = file_cache[part.file_data.file_uri]
-                                content.parts[i] = types.Part.from_bytes(data=data, mime_type="image/png")
-                
-                # [核心修复点] 强制使用关键字参数 model= 和 contents=
-                # 这解决了 "takes 1 positional argument but 3 were given" 的报错
-                return await orig_generate(self_models, model=model, contents=normalized, **kwargs)
-
-            genai.files.AsyncFiles.upload = patched_upload
-            genai.models.AsyncModels.generate_content = patched_generate
-            logger.info("🚀 Base64 文件绕过补丁加载成功 (参数兼容版)")
-            
-        except Exception as ie:
-            logger.warning(f"⚠️ 文件绕过补丁依然失败: {ie}")
-
-    except Exception as e:
-        logger.error(f"❌ 严重：AiHubMix 补丁加载完全失败! 原因: {e}")
-
-# 执行补丁
-_apply_aihubmix_patch()

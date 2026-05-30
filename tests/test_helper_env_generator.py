@@ -1,7 +1,10 @@
 from pathlib import Path
 
-from settings import EpicSettings
-from env_generator import generate_env_example_merged
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from app.settings import EpicSettings
+from tests.env_generator import generate_env_example_merged
 
 
 def test_env_generator():
