@@ -138,4 +138,4 @@ docker/volumes
 user_data
 app/volumes
 
-.bin
+bin/
