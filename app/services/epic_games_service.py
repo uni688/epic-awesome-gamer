@@ -5,6 +5,7 @@
 # Description: 游戏商城控制句柄
 
 import json
+import re
 from contextlib import suppress
 from json import JSONDecodeError
 from typing import List
@@ -191,11 +192,19 @@ class EpicGames:
     @staticmethod
     async def _active_purchase_container(page: Page):
         logger.debug("Scanning for purchase iframe...")
-        iframe_selector = "//iframe[contains(@id, 'webPurchaseContainer') or contains(@src, 'purchase')]"
+        iframe_selector = (
+            "//iframe[contains(@id, 'webPurchaseContainer') "
+            "or contains(@src, 'purchase') "
+            "or contains(@src, 'checkout')]"
+        )
+        await page.locator(iframe_selector).first.wait_for(state="visible", timeout=20000)
         wpc = page.frame_locator(iframe_selector).first
 
         logger.debug("Looking for 'PLACE ORDER' button...")
-        place_order_btn = wpc.locator("button", has_text="PLACE ORDER")
+        place_order_btn = wpc.locator(
+            "button",
+            has_text=re.compile(r"(place\s*order|submit\s*order|order\s*now)", re.IGNORECASE),
+        )
         confirm_btn = wpc.locator("//button[contains(@class, 'payment-confirm__btn')]")
         
         try:
@@ -212,6 +221,30 @@ class EpicGames:
         except AssertionError:
             logger.warning("Primary buttons not found in iframe.")
             raise AssertionError("Could not find Place Order button in iframe")
+
+    @staticmethod
+    async def _is_claimed_on_product_page(page: Page) -> bool:
+        with suppress(Exception):
+            purchase_btn = page.locator("//button[@data-testid='purchase-cta-button']").first
+            if await purchase_btn.is_visible(timeout=3000):
+                btn_text = (await purchase_btn.text_content() or "").upper()
+                if any(s in btn_text for s in ["IN LIBRARY", "OWNED"]):
+                    return True
+
+        with suppress(Exception):
+            body_text = (await page.locator("body").text_content() or "").upper()
+            if "IN LIBRARY" in body_text or "OWNED" in body_text:
+                return True
+
+        return False
+
+    async def _safe_reload(self, page: Page):
+        with suppress(Exception):
+            await page.reload(wait_until="domcontentloaded", timeout=45000)
+            return
+
+        with suppress(Exception):
+            await page.goto(URL_CLAIM, wait_until="domcontentloaded", timeout=45000)
 
     @staticmethod
     async def _uk_confirm_order(wpc: FrameLocator):
@@ -240,8 +273,8 @@ class EpicGames:
 
             try:
                 if not await payment_btn.is_visible():
-                     logger.success("🎉 Instant Checkout: Payment button disappeared (Success inferred)")
-                     return
+                    logger.success("🎉 Instant Checkout: Payment button disappeared (Success inferred)")
+                    return
             except Exception:
                 logger.success("🎉 Instant Checkout: Iframe closed (Success inferred)")
                 return
@@ -249,84 +282,94 @@ class EpicGames:
             with suppress(Exception):
                 await payment_btn.click(force=True)
                 await page.wait_for_timeout(2000)
-            
-            logger.success("Instant checkout flow finished (Blind Success).")
+
+            if await self._is_claimed_on_product_page(page):
+                logger.success("🎉 Instant Checkout: Product state is now in library")
+                return
+
+            logger.success("Instant checkout flow finished (Best-effort).")
 
         except Exception as err:
             logger.warning(f"Instant checkout warning (Game might still be claimed): {err}")
-            await page.reload()
+            await self._safe_reload(page)
 
     async def add_promotion_to_cart(self, page: Page, urls: List[str]) -> bool:
         has_pending_cart_items = False
 
         for url in urls:
-            await page.goto(url, wait_until="load")
-
-            # 404 检测
-            title = await page.title()
-            if "404" in title or "Page Not Found" in title:
-                logger.error(f"❌ Invalid URL (404 Page): {url}")
-                continue
-
-            # 处理年龄限制弹窗
             try:
-                continue_btn = page.locator("//button//span[text()='Continue']")
-                if await continue_btn.is_visible(timeout=5000):
-                    await continue_btn.click()
-            except Exception:
-                pass 
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-            # ------------------------------------------------------------
-            # 🔥 新思路：彻底解决按钮识别问题 (黑名单机制 + 智能点击)
-            # ------------------------------------------------------------
-            
-            # 1. 尝试找到所有可能的“主按钮”
-            # Epic 按钮通常有 'purchase-cta-button' 这个 TestID
-            purchase_btn = page.locator("//button[@data-testid='purchase-cta-button']").first
-
-            # 2. 如果没找到主按钮，尝试找“库中”状态
-            try:
-                if not await purchase_btn.is_visible(timeout=5000):
-                    # 再次检查是否在库中 (有时按钮不叫 purchase-cta，而是简单的 disabled button)
-                    all_text = await page.locator("body").text_content()
-                    if "In Library" in all_text or "Owned" in all_text:
-                         logger.success(f"Already in the library (Page Text Scan) - {url=}")
-                         continue
-                    logger.warning(f"Could not find any purchase button - {url=}")
+                # 404 检测
+                title = await page.title()
+                if "404" in title or "Page Not Found" in title:
+                    logger.error(f"❌ Invalid URL (404 Page): {url}")
                     continue
-            except Exception:
-                pass
 
-            # 3. 获取按钮文字
-            btn_text = await purchase_btn.text_content()
-            if not btn_text: btn_text = ""
-            btn_text_upper = btn_text.strip().upper()
-            
-            logger.debug(f"👉 Found Button: '{btn_text}'")
+                # 处理年龄限制弹窗
+                try:
+                    continue_btn = page.locator("//button//span[text()='Continue']")
+                    if await continue_btn.is_visible(timeout=5000):
+                        await continue_btn.click()
+                except Exception:
+                    pass
 
-            # 4. 黑名单检查：只有这些情况绝对不能点
-            # 如果是 'IN LIBRARY', 'OWNED', 'UNAVAILABLE', 'COMING SOON' -> 跳过
-            if any(s in btn_text_upper for s in ["IN LIBRARY", "OWNED", "UNAVAILABLE", "COMING SOON"]):
-                logger.success(f"Game status is '{btn_text}' - Skipping.")
-                continue
+                # ------------------------------------------------------------
+                # 🔥 新思路：彻底解决按钮识别问题 (黑名单机制 + 智能点击)
+                # ------------------------------------------------------------
 
-            # 5. 白名单检查 (Add to Cart 特殊处理)
-            # 如果包含 'CART'，说明是加入购物车流程
-            if "CART" in btn_text_upper:
-                logger.debug(f"🛒 Logic: Add To Cart - {url=}")
+                # 1. 尝试找到所有可能的“主按钮”
+                # Epic 按钮通常有 'purchase-cta-button' 这个 TestID
+                purchase_btn = page.locator("//button[@data-testid='purchase-cta-button']").first
+
+                # 2. 如果没找到主按钮，尝试找“库中”状态
+                try:
+                    if not await purchase_btn.is_visible(timeout=5000):
+                        # 再次检查是否在库中 (有时按钮不叫 purchase-cta，而是简单的 disabled button)
+                        all_text = await page.locator("body").text_content()
+                        if "In Library" in all_text or "Owned" in all_text:
+                            logger.success(f"Already in the library (Page Text Scan) - {url=}")
+                            continue
+                        logger.warning(f"Could not find any purchase button - {url=}")
+                        continue
+                except Exception:
+                    pass
+
+                # 3. 获取按钮文字
+                btn_text = await purchase_btn.text_content()
+                if not btn_text:
+                    btn_text = ""
+                btn_text_upper = btn_text.strip().upper()
+
+                logger.debug(f"👉 Found Button: '{btn_text}'")
+
+                # 4. 黑名单检查：只有这些情况绝对不能点
+                # 如果是 'IN LIBRARY', 'OWNED', 'UNAVAILABLE', 'COMING SOON' -> 跳过
+                if any(s in btn_text_upper for s in ["IN LIBRARY", "OWNED", "UNAVAILABLE", "COMING SOON"]):
+                    logger.success(f"Game status is '{btn_text}' - Skipping.")
+                    continue
+
+                # 5. 白名单检查 (Add to Cart 特殊处理)
+                # 如果包含 'CART'，说明是加入购物车流程
+                if "CART" in btn_text_upper:
+                    logger.debug(f"🛒 Logic: Add To Cart - {url=}")
+                    await purchase_btn.click()
+                    has_pending_cart_items = True
+                    continue
+
+                # 6. 默认处理 (盲点逻辑)
+                # 只要不是黑名单，也不是购物车，统统当做 "Get/Purchase" 直接点击！
+                # 不管它写的是 'Get', 'Free', 'Purchase', 'Buy Now'，只要 API 说是免费的，我们就点！
+                logger.debug(f"⚡️ Logic: Aggressive Click (Text: {btn_text}) - {url=}")
                 await purchase_btn.click()
-                has_pending_cart_items = True
+
+                # 点击后，转入即时结账流程
+                await self._handle_instant_checkout(page)
+                # ------------------------------------------------------------
+            except Exception as err:
+                logger.warning(f"Failed to process promotion page - {url=} err={err}")
+                await self._safe_reload(page)
                 continue
-            
-            # 6. 默认处理 (盲点逻辑)
-            # 只要不是黑名单，也不是购物车，统统当做 "Get/Purchase" 直接点击！
-            # 不管它写的是 'Get', 'Free', 'Purchase', 'Buy Now'，只要 API 说是免费的，我们就点！
-            logger.debug(f"⚡️ Logic: Aggressive Click (Text: {btn_text}) - {url=}")
-            await purchase_btn.click()
-            
-            # 点击后，转入即时结账流程
-            await self._handle_instant_checkout(page)
-            # ------------------------------------------------------------
 
         return has_pending_cart_items
 
