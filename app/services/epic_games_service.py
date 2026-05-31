@@ -327,7 +327,7 @@ class EpicGames:
                 try:
                     if not await purchase_btn.is_visible(timeout=5000):
                         # 再次检查是否在库中 (有时按钮不叫 purchase-cta，而是简单的 disabled button)
-                        all_text = await page.locator("body").text_content()
+                        all_text = await page.locator("body").text_content() or ""
                         if "In Library" in all_text or "Owned" in all_text:
                             logger.success(f"Already in the library (Page Text Scan) - {url=}")
                             continue
