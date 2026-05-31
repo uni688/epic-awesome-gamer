@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from app.services.epic_games_service import EpicGames
 
@@ -159,7 +160,7 @@ def test_click_cart_checkout_raises_when_missing():
             return None
 
         game._find_best_button = _no_candidate
-        with pytest.raises(TimeoutError):
+        with pytest.raises(PlaywrightTimeoutError):
             await game._click_cart_checkout(FakeCheckoutPage())
 
     asyncio.run(_runner())
