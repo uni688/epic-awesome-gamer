@@ -238,7 +238,8 @@ class EpicGames:
 
         return False
 
-    async def _safe_reload(self, page: Page):
+    @staticmethod
+    async def _safe_reload(page: Page):
         with suppress(Exception):
             await page.reload(wait_until="domcontentloaded", timeout=45000)
             return
