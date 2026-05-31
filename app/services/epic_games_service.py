@@ -8,7 +8,7 @@ import json
 import re
 from contextlib import suppress
 from json import JSONDecodeError
-from typing import List
+from typing import List, Callable, Awaitable
 
 import httpx
 from hcaptcha_challenger.agent import AgentV
@@ -102,12 +102,12 @@ def get_promotions() -> List[PromotionGame]:
 class EpicAgent:
     def __init__(self, page: Page):
         self.page = page
-        self.epic_games = EpicGames(self.page)
         self._promotions: List[PromotionGame] = []
         self._ctx_cookies_is_available: bool = False
         self._orders: List[OrderItem] = []
         self._namespaces: List[str] = []
         self._cookies = None
+        self.epic_games = EpicGames(self.page, self.is_namespace_claimed)
 
     async def _sync_order_history(self):
         if self._orders:
@@ -133,6 +133,11 @@ class EpicAgent:
         await self._sync_order_history()
         self._namespaces = self._namespaces or [order.namespace for order in self._orders]
         self._promotions = [p for p in get_promotions() if p.namespace not in self._namespaces]
+
+    async def is_namespace_claimed(self, namespace: str) -> bool:
+        await self._sync_order_history()
+        namespaces = [order.namespace for order in self._orders]
+        return namespace in namespaces
 
     async def _should_ignore_task(self) -> bool:
         self._ctx_cookies_is_available = False
@@ -176,9 +181,95 @@ class EpicAgent:
 
 
 class EpicGames:
-    def __init__(self, page: Page):
+    FLOW_FREE_CLAIM = "FREE_CLAIM_FLOW"
+    FLOW_CHECKOUT = "CHECKOUT_FLOW"
+    FLOW_AUTH_GATE = "AUTH_GATE_FLOW"
+    FLOW_UNKNOWN = "UNKNOWN_FLOW"
+    IFRAME_SELECTOR = (
+        "//iframe[contains(@id, 'webPurchaseContainer') "
+        "or contains(@src, 'purchase') "
+        "or contains(@src, 'checkout')]"
+    )
+
+    def __init__(
+        self,
+        page: Page,
+        order_checker: Callable[[str], Awaitable[bool]] | None = None,
+    ):
         self.page = page
         self._promotions: List[PromotionGame] = []
+        self._order_checker = order_checker
+        self._game_results: List[dict] = []
+
+    @staticmethod
+    def _score_button_candidate(
+        text: str = "",
+        aria_label: str = "",
+        visible: bool = False,
+        enabled: bool = False,
+        in_viewport: bool = False,
+        keywords: List[str] | None = None,
+    ) -> int:
+        score = 0
+        text_upper = text.upper()
+        aria_upper = aria_label.upper()
+        if keywords and any(word.upper() in text_upper for word in keywords):
+            score += 40
+        if keywords and any(word.upper() in aria_upper for word in keywords):
+            score += 20
+        if visible and enabled:
+            score += 30
+        if in_viewport:
+            score += 10
+        return score
+
+    @staticmethod
+    def _classify_flow_signals(
+        has_auth_gate: bool,
+        has_checkout_iframe: bool,
+        has_free_claim_action: bool,
+    ) -> str:
+        if has_auth_gate:
+            return EpicGames.FLOW_AUTH_GATE
+        if has_checkout_iframe:
+            return EpicGames.FLOW_CHECKOUT
+        if has_free_claim_action:
+            return EpicGames.FLOW_FREE_CLAIM
+        return EpicGames.FLOW_UNKNOWN
+
+    @staticmethod
+    def _has_success_text(text: str) -> bool:
+        text_upper = text.upper()
+        success_flags = [
+            "IN LIBRARY",
+            "OWNED",
+            "THANK YOU",
+            "ORDER COMPLETE",
+            "PURCHASE SUCCESSFUL",
+        ]
+        return any(flag in text_upper for flag in success_flags)
+
+    @staticmethod
+    async def _safe_wait_for_challenge(agent: AgentV, page: Page):
+        challenge_markers = [
+            "iframe[src*='hcaptcha']",
+            "[data-hcaptcha-response]",
+            "text=/I am human|hCaptcha|Verify/i",
+        ]
+        has_challenge = False
+        for marker in challenge_markers:
+            with suppress(Exception):
+                if await page.locator(marker).first.is_visible(timeout=1500):
+                    has_challenge = True
+                    break
+
+        if not has_challenge:
+            return
+
+        try:
+            await agent.wait_for_challenge()
+        except Exception as err:
+            logger.warning(f"Captcha handler isolated error: {err}")
 
     @staticmethod
     async def _agree_license(page: Page):
@@ -188,55 +279,6 @@ class EpicGames:
             accept = page.locator("//button//span[text()='Accept']")
             if await accept.is_enabled():
                 await accept.click()
-
-    @staticmethod
-    async def _active_purchase_container(page: Page):
-        logger.debug("Scanning for purchase iframe...")
-        iframe_selector = (
-            "//iframe[contains(@id, 'webPurchaseContainer') "
-            "or contains(@src, 'purchase') "
-            "or contains(@src, 'checkout')]"
-        )
-        await page.locator(iframe_selector).first.wait_for(state="visible", timeout=20000)
-        wpc = page.frame_locator(iframe_selector).first
-
-        logger.debug("Looking for 'PLACE ORDER' button...")
-        place_order_btn = wpc.locator(
-            "button",
-            has_text=re.compile(r"(place\s*order|submit\s*order|order\s*now)", re.IGNORECASE),
-        )
-        confirm_btn = wpc.locator("//button[contains(@class, 'payment-confirm__btn')]")
-        
-        try:
-            await expect(place_order_btn).to_be_visible(timeout=15000)
-            logger.debug("✅ Found 'PLACE ORDER' button via text match")
-            return wpc, place_order_btn
-        except AssertionError:
-            pass
-            
-        try:
-            await expect(confirm_btn).to_be_visible(timeout=5000)
-            logger.debug("✅ Found button via CSS class match")
-            return wpc, confirm_btn
-        except AssertionError:
-            logger.warning("Primary buttons not found in iframe.")
-            raise AssertionError("Could not find Place Order button in iframe")
-
-    @staticmethod
-    async def _is_claimed_on_product_page(page: Page) -> bool:
-        with suppress(Exception):
-            purchase_btn = page.locator("//button[@data-testid='purchase-cta-button']").first
-            if await purchase_btn.is_visible(timeout=3000):
-                btn_text = (await purchase_btn.text_content() or "").upper()
-                if any(s in btn_text for s in ["IN LIBRARY", "OWNED"]):
-                    return True
-
-        with suppress(Exception):
-            body_text = (await page.locator("body").text_content() or "").upper()
-            if "IN LIBRARY" in body_text or "OWNED" in body_text:
-                return True
-
-        return False
 
     @staticmethod
     async def _safe_reload(page: Page):
@@ -256,122 +298,391 @@ class EpicGames:
                 await accept.click()
                 return True
 
-    async def _handle_instant_checkout(self, page: Page):
-        logger.info("🚀 Triggering Instant Checkout Flow...")
-        agent = AgentV(page=page, agent_config=settings)
+    async def _collect_button_candidates(self, scope, keywords: List[str], source: str) -> List[dict]:
+        selectors = [
+            "button",
+            "[role='button']",
+            "[aria-label]",
+            "[data-testid='purchase-cta-button']",
+        ]
+        candidates: List[dict] = []
+        for selector in selectors:
+            locator = scope.locator(selector)
+            count = min(await locator.count(), 30)
+            for i in range(count):
+                btn = locator.nth(i)
+                try:
+                    text = (await btn.text_content() or "").strip()
+                    aria = (await btn.get_attribute("aria-label") or "").strip()
+                    if not text and not aria:
+                        continue
+                    visible = await btn.is_visible()
+                    enabled = await btn.is_enabled()
+                    box = await btn.bounding_box()
+                    in_viewport = bool(box and box.get("width", 0) > 0 and box.get("height", 0) > 0)
+                    score = self._score_button_candidate(
+                        text=text,
+                        aria_label=aria,
+                        visible=visible,
+                        enabled=enabled,
+                        in_viewport=in_viewport,
+                        keywords=keywords,
+                    )
+                    candidates.append(
+                        {
+                            "locator": btn,
+                            "text": text,
+                            "aria": aria,
+                            "score": score,
+                            "visible": visible,
+                            "enabled": enabled,
+                            "source": source,
+                        }
+                    )
+                except Exception:
+                    continue
+        return candidates
+
+    async def _find_best_button(self, page: Page, keywords: List[str]) -> dict | None:
+        candidates: List[dict] = []
+        candidates.extend(await self._collect_button_candidates(page, keywords, "main_dom"))
 
         try:
-            wpc, payment_btn = await self._active_purchase_container(page)
-            logger.debug(f"Clicking payment button: {await payment_btn.text_content()}")
-            await payment_btn.click(force=True)
+            await page.locator(self.IFRAME_SELECTOR).first.wait_for(state="visible", timeout=2000)
+            iframe = page.frame_locator(self.IFRAME_SELECTOR).first
+            candidates.extend(await self._collect_button_candidates(iframe, keywords, "iframe"))
+        except Exception:
+            pass
+
+        shadow_candidate = await page.evaluate(
+            """
+            (words) => {
+              const queue = [document];
+              const out = [];
+              while (queue.length) {
+                const root = queue.shift();
+                const elements = root.querySelectorAll("button,[role='button'],[aria-label]");
+                for (const el of elements) {
+                  const text = (el.textContent || "").trim();
+                  const aria = (el.getAttribute("aria-label") || "").trim();
+                  if (!text && !aria) continue;
+                  const full = `${text} ${aria}`.toUpperCase();
+                  const score = words.some((w) => full.includes(w.toUpperCase())) ? 1 : 0;
+                  if (score) {
+                    out.push({ text, aria, selector: el.tagName.toLowerCase() });
+                  }
+                }
+                const hosts = root.querySelectorAll("*");
+                for (const host of hosts) {
+                  if (host.shadowRoot) queue.push(host.shadowRoot);
+                }
+              }
+              return out[0] || null;
+            }
+            """,
+            keywords,
+        )
+        if shadow_candidate:
+            candidates.append(
+                {
+                    "locator": None,
+                    "text": shadow_candidate.get("text") or "",
+                    "aria": shadow_candidate.get("aria") or "",
+                    "score": 25,
+                    "visible": True,
+                    "enabled": True,
+                    "source": "shadow_dom",
+                }
+            )
+
+        if not candidates:
             await page.wait_for_timeout(3000)
-            
-            try:
-                logger.debug("Checking for CAPTCHA...")
-                await agent.wait_for_challenge()
-            except Exception as e:
-                logger.info(f"CAPTCHA detection skipped (Likely no CAPTCHA needed): {e}")
+            candidates.extend(await self._collect_button_candidates(page, keywords, "main_dom_wait"))
 
-            try:
-                if not await payment_btn.is_visible():
-                    logger.success("🎉 Instant Checkout: Payment button disappeared (Success inferred)")
-                    return
-            except Exception:
-                logger.success("🎉 Instant Checkout: Iframe closed (Success inferred)")
-                return
+        if not candidates:
+            return None
 
+        candidates.sort(
+            key=lambda c: (
+                c["score"],
+                1 if c["source"] == "main_dom" else 0,
+                1 if c["visible"] else 0,
+                1 if c["enabled"] else 0,
+            ),
+            reverse=True,
+        )
+        return candidates[0]
+
+    async def _is_auth_gate_present(self, page: Page) -> bool:
+        auth_selectors = [
+            "#email",
+            "#password",
+            "#sign-in",
+            "text=/Sign in|Log in/i",
+        ]
+        for selector in auth_selectors:
             with suppress(Exception):
-                await payment_btn.click(force=True)
-                await page.wait_for_timeout(2000)
+                if await page.locator(selector).first.is_visible(timeout=1200):
+                    return True
+        return False
+
+    async def _has_checkout_iframe(self, page: Page) -> bool:
+        with suppress(Exception):
+            return await page.locator(self.IFRAME_SELECTOR).first.is_visible(timeout=1500)
+        return False
+
+    async def _classify_flow(self, page: Page) -> str:
+        has_auth_gate = await self._is_auth_gate_present(page)
+        has_checkout_iframe = await self._has_checkout_iframe(page)
+        free_candidate = await self._find_best_button(page, ["add to library", "confirm", "get"])
+        has_free_claim_action = bool(free_candidate and free_candidate.get("score", 0) > 0)
+        return self._classify_flow_signals(
+            has_auth_gate=has_auth_gate,
+            has_checkout_iframe=has_checkout_iframe,
+            has_free_claim_action=has_free_claim_action,
+        )
+
+    async def _active_purchase_container(self, page: Page):
+        logger.debug("Scanning for purchase iframe...")
+        await page.locator(self.IFRAME_SELECTOR).first.wait_for(state="visible", timeout=20000)
+        wpc = page.frame_locator(self.IFRAME_SELECTOR).first
+
+        action_btn = wpc.locator(
+            "button",
+            has_text=re.compile(
+                r"(place\s*order|submit\s*order|order\s*now|complete\s*order|pay\s*now|confirm)",
+                re.IGNORECASE,
+            ),
+        )
+        confirm_btn = wpc.locator("//button[contains(@class, 'payment-confirm__btn')]")
+
+        try:
+            await expect(action_btn).to_be_visible(timeout=15000)
+            return wpc, action_btn.first
+        except AssertionError:
+            pass
+
+        try:
+            await expect(confirm_btn).to_be_visible(timeout=5000)
+            return wpc, confirm_btn.first
+        except AssertionError:
+            raise AssertionError("Could not find checkout button in iframe")
+
+    async def _handle_checkout_flow(self, page: Page):
+        logger.info("🚀 Handling checkout flow...")
+        agent = AgentV(page=page, agent_config=settings)
+        wpc, payment_btn = await self._active_purchase_container(page)
+        await payment_btn.click(force=True)
+        await page.wait_for_timeout(2500)
+        await self._safe_wait_for_challenge(agent, page)
+        with suppress(Exception):
+            await self._uk_confirm_order(wpc)
+            await payment_btn.click(force=True)
+
+    async def _handle_free_claim_flow(self, page: Page):
+        logger.info("🎁 Handling add-to-library flow...")
+        button = await self._find_best_button(page, ["add to library", "confirm", "get"])
+        if not button:
+            raise AssertionError("Could not find Add to library/Get/Confirm button")
+
+        if button["source"] == "shadow_dom":
+            await page.evaluate(
+                """
+                (words) => {
+                  const queue = [document];
+                  while (queue.length) {
+                    const root = queue.shift();
+                    const elements = root.querySelectorAll("button,[role='button'],[aria-label]");
+                    for (const el of elements) {
+                      const text = `${el.textContent || ""} ${el.getAttribute("aria-label") || ""}`.toUpperCase();
+                      if (words.some((w) => text.includes(w.toUpperCase()))) {
+                        el.click();
+                        return true;
+                      }
+                    }
+                    const hosts = root.querySelectorAll("*");
+                    for (const host of hosts) {
+                      if (host.shadowRoot) queue.push(host.shadowRoot);
+                    }
+                  }
+                  return false;
+                }
+                """,
+                ["add to library", "confirm", "get"],
+            )
+            return
+
+        await button["locator"].click(force=True)
+        await page.wait_for_timeout(1500)
+        second_button = await self._find_best_button(page, ["add to library", "confirm", "place order"])
+        if second_button and second_button["locator"] is not None and second_button["score"] > 35:
+            with suppress(Exception):
+                await second_button["locator"].click(force=True)
+
+    @staticmethod
+    async def _is_claimed_on_product_page(page: Page) -> bool:
+        with suppress(Exception):
+            purchase_btn = page.locator("//button[@data-testid='purchase-cta-button']").first
+            if await purchase_btn.is_visible(timeout=3000):
+                btn_text = (await purchase_btn.text_content() or "").upper()
+                if any(s in btn_text for s in ["IN LIBRARY", "OWNED"]):
+                    return True
+
+        with suppress(Exception):
+            body_text = (await page.locator("body").text_content() or "").upper()
+            if "IN LIBRARY" in body_text or "OWNED" in body_text:
+                return True
+
+        return False
+
+    async def _verify_claim_success(self, page: Page, promotion: PromotionGame) -> bool:
+        if await self._is_claimed_on_product_page(page):
+            return True
+
+        with suppress(Exception):
+            toast_text = await page.locator("[role='alert']").first.text_content() or ""
+            if self._has_success_text(toast_text):
+                return True
+
+        with suppress(Exception):
+            body_text = await page.locator("body").text_content() or ""
+            if self._has_success_text(body_text):
+                return True
+
+        if self._order_checker:
+            with suppress(Exception):
+                if await self._order_checker(promotion.namespace):
+                    return True
+
+        return False
+
+    async def _handle_auth_gate_flow(self, page: Page):
+        logger.warning("Auth gate detected, trying to recover session.")
+        with suppress(Exception):
+            await page.goto(URL_CLAIM, wait_until="domcontentloaded", timeout=45000)
+            return
+        await self._safe_reload(page)
+
+    async def _click_entry_button(self, page: Page) -> str:
+        button = await self._find_best_button(page, ["get", "add to library", "cart", "purchase", "free"])
+        if not button:
+            raise AssertionError("Could not find purchase entry button")
+        btn_text = f"{button.get('text', '')} {button.get('aria', '')}".strip()
+        if button["source"] == "shadow_dom":
+            await self._handle_free_claim_flow(page)
+            return btn_text
+        await button["locator"].click(force=True)
+        return btn_text
+
+    async def _process_single_promotion(self, page: Page, promotion: PromotionGame) -> tuple[bool, bool]:
+        has_pending_cart_items = False
+        result = {
+            "title": promotion.title,
+            "url": promotion.url,
+            "flow": self.FLOW_UNKNOWN,
+            "verified": False,
+            "retries": 0,
+            "status": "failed",
+        }
+
+        await page.goto(promotion.url, wait_until="domcontentloaded", timeout=60000)
+        title = await page.title()
+        if "404" in title or "Page Not Found" in title:
+            logger.error(f"❌ Invalid URL (404 Page): {promotion.url}")
+            self._game_results.append(result)
+            return False, False
+
+        for attempt in range(1, 4):
+            result["retries"] = attempt - 1
+            with suppress(Exception):
+                continue_btn = page.locator("//button//span[text()='Continue']")
+                if await continue_btn.is_visible(timeout=3000):
+                    await continue_btn.click()
 
             if await self._is_claimed_on_product_page(page):
-                logger.success("🎉 Instant Checkout: Product state is now in library")
-                return
+                result["status"] = "already_owned"
+                result["verified"] = True
+                self._game_results.append(result)
+                return True, False
 
-            logger.success("Instant checkout flow finished (Best-effort).")
-
-        except Exception as err:
-            logger.warning(f"Instant checkout warning (Game might still be claimed): {err}")
-            await self._safe_reload(page)
-
-    async def add_promotion_to_cart(self, page: Page, urls: List[str]) -> bool:
-        has_pending_cart_items = False
-
-        for url in urls:
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-
-                # 404 检测
-                title = await page.title()
-                if "404" in title or "Page Not Found" in title:
-                    logger.error(f"❌ Invalid URL (404 Page): {url}")
-                    continue
-
-                # 处理年龄限制弹窗
-                try:
-                    continue_btn = page.locator("//button//span[text()='Continue']")
-                    if await continue_btn.is_visible(timeout=5000):
-                        await continue_btn.click()
-                except Exception:
-                    pass
-
-                # ------------------------------------------------------------
-                # 🔥 新思路：彻底解决按钮识别问题 (黑名单机制 + 智能点击)
-                # ------------------------------------------------------------
-
-                # 1. 尝试找到所有可能的“主按钮”
-                # Epic 按钮通常有 'purchase-cta-button' 这个 TestID
-                purchase_btn = page.locator("//button[@data-testid='purchase-cta-button']").first
-
-                # 2. 如果没找到主按钮，尝试找“库中”状态
-                try:
-                    if not await purchase_btn.is_visible(timeout=5000):
-                        # 再次检查是否在库中 (有时按钮不叫 purchase-cta，而是简单的 disabled button)
-                        all_text = await page.locator("body").text_content() or ""
-                        if "In Library" in all_text or "Owned" in all_text:
-                            logger.success(f"Already in the library (Page Text Scan) - {url=}")
-                            continue
-                        logger.warning(f"Could not find any purchase button - {url=}")
-                        continue
-                except Exception:
-                    pass
-
-                # 3. 获取按钮文字
-                btn_text = await purchase_btn.text_content()
-                if not btn_text:
-                    btn_text = ""
-                btn_text_upper = btn_text.strip().upper()
-
-                logger.debug(f"👉 Found Button: '{btn_text}'")
-
-                # 4. 黑名单检查：只有这些情况绝对不能点
-                # 如果是 'IN LIBRARY', 'OWNED', 'UNAVAILABLE', 'COMING SOON' -> 跳过
-                if any(s in btn_text_upper for s in ["IN LIBRARY", "OWNED", "UNAVAILABLE", "COMING SOON"]):
-                    logger.success(f"Game status is '{btn_text}' - Skipping.")
-                    continue
-
-                # 5. 白名单检查 (Add to Cart 特殊处理)
-                # 如果包含 'CART'，说明是加入购物车流程
-                if "CART" in btn_text_upper:
-                    logger.debug(f"🛒 Logic: Add To Cart - {url=}")
-                    await purchase_btn.click()
+                entry_text = await self._click_entry_button(page)
+                if "CART" in entry_text.upper():
                     has_pending_cart_items = True
-                    continue
-
-                # 6. 默认处理 (盲点逻辑)
-                # 只要不是黑名单，也不是购物车，统统当做 "Get/Purchase" 直接点击！
-                # 不管它写的是 'Get', 'Free', 'Purchase', 'Buy Now'，只要 API 说是免费的，我们就点！
-                logger.debug(f"⚡️ Logic: Aggressive Click (Text: {btn_text}) - {url=}")
-                await purchase_btn.click()
-
-                # 点击后，转入即时结账流程
-                await self._handle_instant_checkout(page)
-                # ------------------------------------------------------------
+                    result["status"] = "added_to_cart"
+                    result["verified"] = True
+                    self._game_results.append(result)
+                    return True, True
             except Exception as err:
-                logger.warning(f"Failed to process promotion page - {url=} err={err}")
-                await self._safe_reload(page)
-                continue
+                logger.warning(f"entry click failed {promotion.url=} err={err}")
 
+            flow = await self._classify_flow(page)
+            result["flow"] = flow
+            logger.info(
+                json.dumps(
+                    {
+                        "title": promotion.title,
+                        "flow": flow,
+                        "attempt": attempt,
+                        "url": promotion.url,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+            try:
+                if flow == self.FLOW_AUTH_GATE:
+                    await self._handle_auth_gate_flow(page)
+                elif flow == self.FLOW_CHECKOUT:
+                    await self._handle_checkout_flow(page)
+                elif flow == self.FLOW_FREE_CLAIM:
+                    await self._handle_free_claim_flow(page)
+                else:
+                    await page.wait_for_timeout(2500)
+            except Exception as err:
+                logger.warning(f"flow execution warning {promotion.url=} flow={flow} err={err}")
+
+            verified = await self._verify_claim_success(page, promotion)
+            if verified:
+                result["status"] = "claimed"
+                result["verified"] = True
+                self._game_results.append(result)
+                return True, has_pending_cart_items
+
+            if attempt == 1:
+                await self._safe_reload(page)
+            elif attempt == 2:
+                add_cart_btn = await self._find_best_button(page, ["add to cart", "cart"])
+                if add_cart_btn and add_cart_btn.get("locator") is not None:
+                    with suppress(Exception):
+                        await add_cart_btn["locator"].click(force=True)
+                        has_pending_cart_items = True
+                        await page.goto(URL_CART, wait_until="domcontentloaded")
+            else:
+                result["status"] = "unverified_failed"
+                self._game_results.append(result)
+
+        return False, has_pending_cart_items
+
+    async def add_promotion_to_cart(self, page: Page, promotions: List[PromotionGame]) -> bool:
+        has_pending_cart_items = False
+        for promotion in promotions:
+            try:
+                _, pending = await self._process_single_promotion(page, promotion)
+                has_pending_cart_items = has_pending_cart_items or pending
+            except Exception as err:
+                logger.warning(f"Failed to process promotion page - {promotion.url=} err={err}")
+                await self._safe_reload(page)
+                self._game_results.append(
+                    {
+                        "title": promotion.title,
+                        "url": promotion.url,
+                        "flow": self.FLOW_UNKNOWN,
+                        "verified": False,
+                        "retries": 2,
+                        "status": "failed_with_exception",
+                    }
+                )
         return has_pending_cart_items
 
     async def _empty_cart(self, page: Page, wait_rerender: int = 30) -> bool | None:
@@ -410,7 +721,7 @@ class EpicGames:
             wpc, payment_btn = await self._active_purchase_container(self.page)
             logger.debug("Click payment button")
             await self._uk_confirm_order(wpc)
-            await agent.wait_for_challenge()
+            await self._safe_wait_for_challenge(agent, self.page)
         except Exception as err:
             logger.warning(f"Failed to solve captcha - {err}")
             await self.page.reload()
@@ -418,8 +729,8 @@ class EpicGames:
 
     @retry(retry=retry_if_exception_type(TimeoutError), stop=stop_after_attempt(2), reraise=True)
     async def collect_weekly_games(self, promotions: List[PromotionGame]):
-        urls = [p.url for p in promotions]
-        has_cart_items = await self.add_promotion_to_cart(self.page, urls)
+        self._game_results = []
+        has_cart_items = await self.add_promotion_to_cart(self.page, promotions)
 
         if has_cart_items:
             await self._purchase_free_game()
@@ -428,5 +739,10 @@ class EpicGames:
                 logger.success("🎉 Successfully collected cart games")
             except TimeoutError:
                 logger.warning("Failed to collect cart games")
-        else:
-            logger.success("🎉 Process completed (Instant claimed or already owned)")
+
+        verified_count = len([r for r in self._game_results if r.get("verified")])
+        failed_count = len([r for r in self._game_results if not r.get("verified")])
+        logger.success(
+            f"🎉 Process completed (verified={verified_count}, unverified={failed_count})"
+        )
+        logger.info(json.dumps(self._game_results, ensure_ascii=False))
