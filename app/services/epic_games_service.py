@@ -707,13 +707,38 @@ class EpicGames:
             logger.warning("Failed to empty shopping cart", err=err)
             return False
 
+    async def _click_cart_checkout(self, page: Page) -> None:
+        candidate = await self._find_best_button(
+            page, ["check out", "checkout", "place order", "order now"]
+        )
+        if candidate and candidate.get("locator") is not None and candidate.get("score", 0) > 0:
+            await candidate["locator"].click(force=True)
+            return
+
+        fallback_selectors = [
+            "button:has-text('Check Out')",
+            "button:has-text('Checkout')",
+            "a:has-text('Check Out')",
+            "a:has-text('Checkout')",
+            "//button[contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'CHECK OUT') or contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'CHECKOUT')]",
+            "//a[contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'CHECK OUT') or contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'CHECKOUT')]",
+        ]
+        for selector in fallback_selectors:
+            with suppress(Exception):
+                checkout = page.locator(selector).first
+                if await checkout.is_visible(timeout=1200) and await checkout.is_enabled():
+                    await checkout.click(force=True)
+                    return
+
+        raise TimeoutError("Could not find checkout action on cart page")
+
     async def _purchase_free_game(self):
         await self.page.goto(URL_CART, wait_until="domcontentloaded")
         logger.debug("Move ALL paid games from the shopping cart out")
         await self._empty_cart(self.page)
 
         agent = AgentV(page=self.page, agent_config=settings)
-        await self.page.click("//button//span[text()='Check Out']")
+        await self._click_cart_checkout(self.page)
         await self._agree_license(self.page)
 
         try:
