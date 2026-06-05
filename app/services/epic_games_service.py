@@ -142,11 +142,27 @@ class EpicAgent:
     async def _should_ignore_task(self) -> bool:
         self._ctx_cookies_is_available = False
         await self.page.goto(URL_CLAIM, wait_until="domcontentloaded")
-        status = await self.page.locator("//egs-navigation").get_attribute("isloggedin")
-        if status == "false":
-            logger.error("❌ context cookies is not available")
+        try:
+            status = await self.page.locator("//egs-navigation").get_attribute("isloggedin", timeout=5000)
+            if status == "false":
+                logger.error("❌ context cookies is not available")
+                return False
+            elif status == "true":
+                self._ctx_cookies_is_available = True
+        except Exception:
+            logger.warning("egs-navigation check failed, verifying via order history...")
+            try:
+                await self.page.goto("https://www.epicgames.com/account/v2/payment/ajaxGetOrderHistory", wait_until="domcontentloaded")
+                content = await self.page.text_content("//pre", timeout=5000)
+                if "orders" in json.loads(content):
+                    self._ctx_cookies_is_available = True
+            except Exception:
+                logger.error("❌ context cookies is not available (order history check failed)")
+                return False
+
+        if not self._ctx_cookies_is_available:
             return False
-        self._ctx_cookies_is_available = True
+
         await self._check_orders()
         if not self._promotions:
             return True
@@ -158,7 +174,7 @@ class EpicAgent:
             return
 
         if not self._ctx_cookies_is_available:
-            return
+            raise RuntimeError("Context cookies is not available")
 
         if not self._promotions:
             await self._check_orders()
@@ -172,10 +188,7 @@ class EpicAgent:
             logger.debug(f"Discover promotion \n{pj}")
 
         if self._promotions:
-            try:
-                await self.epic_games.collect_weekly_games(self._promotions)
-            except Exception as e:
-                logger.exception(e)
+            await self.epic_games.collect_weekly_games(self._promotions)
         
         logger.debug("All tasks in the workflow have been completed")
 
@@ -599,6 +612,11 @@ class EpicGames:
                 if await continue_btn.is_visible(timeout=3000):
                     await continue_btn.click()
 
+            with suppress(Exception):
+                cookie_btn = page.locator("button:has-text('Accept All')")
+                if await cookie_btn.is_visible(timeout=1000):
+                    await cookie_btn.click()
+
             if await self._is_claimed_on_product_page(page):
                 result["status"] = "already_owned"
                 result["verified"] = True
@@ -746,3 +764,6 @@ class EpicGames:
             f"🎉 Process completed (verified={verified_count}, unverified={failed_count})"
         )
         logger.info(json.dumps(self._game_results, ensure_ascii=False))
+
+        if failed_count > 0:
+            raise RuntimeError(f"Failed to claim {failed_count} games")
