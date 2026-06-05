@@ -142,11 +142,27 @@ class EpicAgent:
     async def _should_ignore_task(self) -> bool:
         self._ctx_cookies_is_available = False
         await self.page.goto(URL_CLAIM, wait_until="domcontentloaded")
-        status = await self.page.locator("//egs-navigation").get_attribute("isloggedin")
-        if status == "false":
-            logger.error("❌ context cookies is not available")
+        try:
+            status = await self.page.locator("//egs-navigation").get_attribute("isloggedin", timeout=5000)
+            if status == "false":
+                logger.error("❌ context cookies is not available")
+                return False
+            elif status == "true":
+                self._ctx_cookies_is_available = True
+        except Exception:
+            logger.warning("egs-navigation check failed, verifying via order history...")
+            try:
+                await self.page.goto("https://www.epicgames.com/account/v2/payment/ajaxGetOrderHistory", wait_until="domcontentloaded")
+                content = await self.page.text_content("//pre", timeout=5000)
+                if "orders" in json.loads(content):
+                    self._ctx_cookies_is_available = True
+            except Exception:
+                logger.error("❌ context cookies is not available (order history check failed)")
+                return False
+
+        if not self._ctx_cookies_is_available:
             return False
-        self._ctx_cookies_is_available = True
+
         await self._check_orders()
         if not self._promotions:
             return True

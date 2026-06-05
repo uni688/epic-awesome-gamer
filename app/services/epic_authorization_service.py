@@ -117,9 +117,21 @@ class EpicAuthorization:
         for _ in range(3):
             await self.page.goto(URL_CLAIM, wait_until="domcontentloaded")
 
-            if "true" == await self.page.locator("//egs-navigation").get_attribute("isloggedin"):
-                logger.success("Epic Games is already logged in")
-                return True
+            try:
+                status = await self.page.locator("//egs-navigation").get_attribute("isloggedin", timeout=5000)
+                if status == "true":
+                    logger.success("Epic Games is already logged in")
+                    return True
+            except Exception:
+                logger.warning("egs-navigation check failed, verifying via order history...")
+                try:
+                    await self.page.goto("https://www.epicgames.com/account/v2/payment/ajaxGetOrderHistory", wait_until="domcontentloaded")
+                    content = await self.page.text_content("//pre", timeout=5000)
+                    if "orders" in json.loads(content):
+                        logger.success("Epic Games is already logged in")
+                        return True
+                except Exception:
+                    pass
 
             if await self._login():
                 return

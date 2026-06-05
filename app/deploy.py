@@ -42,7 +42,7 @@ init_log(
 TIMEZONE = timezone("Asia/Shanghai")
 
 
-@logger.catch
+@logger.catch(reraise=True)
 async def execute_browser_tasks(headless: bool = True):
     """
     Execute Epic Games free game collection tasks using browser automation.
