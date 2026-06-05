@@ -158,7 +158,7 @@ class EpicAgent:
             return
 
         if not self._ctx_cookies_is_available:
-            return
+            raise RuntimeError("Context cookies is not available")
 
         if not self._promotions:
             await self._check_orders()
@@ -172,10 +172,7 @@ class EpicAgent:
             logger.debug(f"Discover promotion \n{pj}")
 
         if self._promotions:
-            try:
-                await self.epic_games.collect_weekly_games(self._promotions)
-            except Exception as e:
-                logger.exception(e)
+            await self.epic_games.collect_weekly_games(self._promotions)
         
         logger.debug("All tasks in the workflow have been completed")
 
@@ -599,6 +596,11 @@ class EpicGames:
                 if await continue_btn.is_visible(timeout=3000):
                     await continue_btn.click()
 
+            with suppress(Exception):
+                cookie_btn = page.locator("button:has-text('Accept All')")
+                if await cookie_btn.is_visible(timeout=1000):
+                    await cookie_btn.click()
+
             if await self._is_claimed_on_product_page(page):
                 result["status"] = "already_owned"
                 result["verified"] = True
@@ -746,3 +748,6 @@ class EpicGames:
             f"🎉 Process completed (verified={verified_count}, unverified={failed_count})"
         )
         logger.info(json.dumps(self._game_results, ensure_ascii=False))
+
+        if failed_count > 0:
+            raise RuntimeError(f"Failed to claim {failed_count} games")
