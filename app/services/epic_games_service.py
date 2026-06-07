@@ -699,7 +699,10 @@ class EpicGames:
                 return True
 
         with suppress(Exception):
-            return any("challenges.cloudflare.com" in frame.url for frame in page.frames)
+            return any(
+                (urlparse(frame.url).hostname or "").lower() == "challenges.cloudflare.com"
+                for frame in page.frames
+            )
 
         return False
 
