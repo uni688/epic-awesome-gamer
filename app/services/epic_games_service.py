@@ -6,13 +6,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from contextlib import suppress
 from datetime import datetime
 from json import JSONDecodeError
 from pathlib import Path
-from typing import Awaitable, Callable, List, Optional
+from typing import Any, Awaitable, Callable, List, Optional
+from urllib.parse import urlparse
 
 import httpx
 from hcaptcha_challenger.agent import AgentV
@@ -137,8 +139,8 @@ class EpicAgent:
         self._cookies = None
         self.epic_games = EpicGames(self.page, self.is_namespace_claimed)
 
-    async def _sync_order_history(self):
-        if self._orders:
+    async def _sync_order_history(self, force: bool = False):
+        if self._orders and not force:
             return
 
         completed_orders: List[OrderItem] = []
@@ -169,7 +171,7 @@ class EpicAgent:
         self._promotions = [p for p in get_promotions() if p.namespace not in self._namespaces]
 
     async def is_namespace_claimed(self, namespace: str) -> bool:
-        await self._sync_order_history()
+        await self._sync_order_history(force=True)
         namespaces = [order.namespace for order in self._orders]
         return namespace in namespaces
 
@@ -208,7 +210,10 @@ class EpicAgent:
             return
 
         for p in self._promotions:
-            logger.debug("Discover promotion \n" + json.dumps({"title": p.title, "url": p.url}, indent=2, ensure_ascii=False))
+            logger.debug(
+                "Discover promotion \n"
+                + json.dumps({"title": p.title, "url": p.url}, indent=2, ensure_ascii=False)
+            )
 
         try:
             await self.epic_games.collect_weekly_games(self._promotions)
@@ -253,7 +258,6 @@ class EpicGames:
         if self._page_is_closed(self.page):
             logger.warning(f"页面已关闭，阶段[{stage}]将尝试恢复")
 
-
     async def _recover_page_if_closed(self, page: Page, stage: str) -> Page:
         """当页面意外关闭时，基于同一 context 尝试重建页面。"""
         if not self._page_is_closed(page):
@@ -271,7 +275,9 @@ class EpicGames:
         logger.error(f"页面恢复失败: stage={stage}")
         return page
 
-    async def _dump_debug_snapshot(self, page: Page, tag: str, promotion: PromotionGame | None = None):
+    async def _dump_debug_snapshot(
+        self, page: Page, tag: str, promotion: PromotionGame | None = None
+    ):
         """尽可能保留现场信息，便于后续定位按钮或页面状态。"""
         try:
             ts = _now_tag()
@@ -309,10 +315,7 @@ class EpicGames:
                 info["promotion"] = {"title": promotion.title, "url": promotion.url}
 
             with suppress(Exception):
-                info["frames"] = [
-                    {"url": fr.url, "name": fr.name}
-                    for fr in page.frames[:20]
-                ]
+                info["frames"] = [{"url": fr.url, "name": fr.name} for fr in page.frames[:20]]
 
             candidates = await self._collect_visible_button_snapshot(page)
             info["buttons"] = candidates[:40]
@@ -373,6 +376,30 @@ class EpicGames:
         return out
 
     @staticmethod
+    def _has_negative_button_signal(text: str = "", aria_label: str = "") -> bool:
+        merged = _safe_upper(f"{text} {aria_label}")
+        negative_flags = [
+            "COMING SOON",
+            "UNAVAILABLE",
+            "ADD TO WISHLIST",
+            "WISHLIST",
+            "NOTIFY ME",
+            "FREE JUN",
+            "FREE JUL",
+            "FREE AUG",
+            "FREE SEP",
+            "FREE OCT",
+            "FREE NOV",
+            "FREE DEC",
+            "FREE JAN",
+            "FREE FEB",
+            "FREE MAR",
+            "FREE APR",
+            "FREE MAY",
+        ]
+        return any(flag in merged for flag in negative_flags)
+
+    @staticmethod
     def _score_button_candidate(
         text: str = "",
         aria_label: str = "",
@@ -389,6 +416,8 @@ class EpicGames:
             score += 50
         if keywords and any(word.upper() in aria_upper for word in keywords):
             score += 25
+        if EpicGames._has_negative_button_signal(text, aria_label):
+            score -= 100
         if visible:
             score += 20
         if enabled:
@@ -419,12 +448,16 @@ class EpicGames:
             "OWNED",
             "THANK YOU",
             "ORDER COMPLETE",
+            "ORDER COMPLETED",
             "PURCHASE SUCCESSFUL",
-            "SUCCESS",
+            "PURCHASE COMPLETE",
             "ALREADY OWNED",
+            "ADDED TO YOUR LIBRARY",
             "已在库中",
             "已拥有",
             "领取成功",
+            "订单完成",
+            "购买成功",
         ]
         return any(flag.upper() in text_upper for flag in success_flags)
 
@@ -475,28 +508,226 @@ class EpicGames:
             "加入库",
         ]
 
+    HCAPTCHA_CHALLENGE_KEYWORDS = (
+        "hcaptcha_challenge",
+        "hcaptcha",
+        "/getcaptcha/",
+        "/checkcaptcha/",
+    )
+
+    @classmethod
+    def _contains_hcaptcha_challenge(cls, payload: Any) -> bool:
+        if payload is None:
+            return False
+
+        if isinstance(payload, str):
+            return any(keyword in payload.lower() for keyword in cls.HCAPTCHA_CHALLENGE_KEYWORDS)
+
+        if isinstance(payload, dict):
+            return any(
+                cls._contains_hcaptcha_challenge(key) or cls._contains_hcaptcha_challenge(value)
+                for key, value in payload.items()
+            )
+
+        if isinstance(payload, (list, tuple, set)):
+            return any(cls._contains_hcaptcha_challenge(item) for item in payload)
+
+        return False
+
+    @classmethod
+    def _is_hcaptcha_challenge_url(cls, url: str | None) -> bool:
+        return cls._contains_hcaptcha_challenge(url or "")
+
     @staticmethod
-    async def _safe_wait_for_challenge(agent: AgentV, page: Page):
+    def _agent_has_pending_hcaptcha_challenge(agent: AgentV) -> bool:
+        for attr in ("_captcha_payload",):
+            with suppress(Exception):
+                if getattr(agent, attr) is not None:
+                    return True
+
+        for attr in ("_captcha_payload_queue", "_captcha_response_queue"):
+            with suppress(Exception):
+                queue = getattr(agent, attr)
+                if not queue.empty():
+                    return True
+
+        return False
+
+    @classmethod
+    async def _wait_for_hcaptcha_challenge_signal(cls, page: Page, timeout_ms: int = 5000) -> bool:
+        async def _wait_for_event(event_name: str) -> bool:
+            event = await page.wait_for_event(
+                event_name,
+                predicate=lambda item: cls._is_hcaptcha_challenge_url(getattr(item, "url", "")),
+                timeout=timeout_ms,
+            )
+            return event is not None
+
+        tasks = [
+            asyncio.create_task(_wait_for_event("request")),
+            asyncio.create_task(_wait_for_event("response")),
+        ]
+        try:
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            detected = False
+            for task in done:
+                if task.cancelled():
+                    continue
+                with suppress(Exception):
+                    detected = detected or bool(task.result())
+            return detected
+        except Exception:
+            return False
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    @classmethod
+    def _watch_hcaptcha_challenge(cls, page: Page):
+        challenge_signal: asyncio.Queue[bool] = asyncio.Queue(maxsize=1)
+        created_tasks: set[asyncio.Task] = set()
+
+        def _signal_challenge():
+            if challenge_signal.empty():
+                challenge_signal.put_nowait(True)
+
+        def _handle_request(request):
+            if cls._is_hcaptcha_challenge_url(getattr(request, "url", "")):
+                _signal_challenge()
+
+        async def _inspect_response(response):
+            if cls._is_hcaptcha_challenge_url(getattr(response, "url", "")):
+                _signal_challenge()
+                return
+
+            with suppress(Exception):
+                headers = getattr(response, "headers", {}) or {}
+                content_type = headers.get("content-type", "")
+                if "json" in content_type.lower():
+                    if cls._contains_hcaptcha_challenge(await response.json()):
+                        _signal_challenge()
+                        return
+
+            with suppress(Exception):
+                text = await response.text()
+                if cls._contains_hcaptcha_challenge(text):
+                    _signal_challenge()
+
+        def _handle_response(response):
+            task = asyncio.create_task(_inspect_response(response))
+            created_tasks.add(task)
+            task.add_done_callback(created_tasks.discard)
+
+        with suppress(Exception):
+            page.on("request", _handle_request)
+        with suppress(Exception):
+            page.on("response", _handle_response)
+
+        def _cleanup():
+            for task in list(created_tasks):
+                if not task.done():
+                    task.cancel()
+            with suppress(Exception):
+                page.remove_listener("request", _handle_request)
+            with suppress(Exception):
+                page.remove_listener("response", _handle_response)
+
+        return challenge_signal, _cleanup
+
+    @staticmethod
+    async def _safe_wait_for_challenge(
+        agent: AgentV,
+        page: Page,
+        challenge_signal: asyncio.Queue[bool] | None = None,
+    ):
         challenge_markers = [
             "iframe[src*='hcaptcha']",
             "[data-hcaptcha-response]",
             "text=/I am human|hCaptcha|Verify/i",
         ]
-        has_challenge = False
-        for marker in challenge_markers:
+        has_challenge = EpicGames._agent_has_pending_hcaptcha_challenge(agent)
+
+        if not has_challenge and challenge_signal is not None:
             with suppress(Exception):
-                if await page.locator(marker).first.is_visible(timeout=1500):
-                    has_challenge = True
-                    break
+                has_challenge = not challenge_signal.empty()
+
+        if not has_challenge:
+            for marker in challenge_markers:
+                with suppress(Exception):
+                    if await page.locator(marker).first.is_visible(timeout=1500):
+                        has_challenge = True
+                        break
+
+        if not has_challenge:
+            has_challenge = await EpicGames._wait_for_hcaptcha_challenge_signal(page)
 
         if not has_challenge:
             return
 
         try:
-            logger.debug("检测到验证码挑战，开始等待处理")
+            logger.debug("检测到 hcaptcha_challenge，调用内置挑战处理接口")
             await agent.wait_for_challenge()
         except Exception as err:
             logger.warning(f"Captcha handler isolated error: {err}")
+
+    @staticmethod
+    async def _is_cloudflare_challenge_page(page: Page) -> bool:
+        with suppress(Exception):
+            title = _safe_upper(await page.title())
+            if "JUST A MOMENT" in title or "ATTENTION REQUIRED" in title:
+                return True
+
+        with suppress(Exception):
+            raw_url = page.url
+            url = _safe_upper(raw_url)
+            host = (urlparse(raw_url).hostname or "").lower()
+            if "__CF_CHL" in url or host == "challenges.cloudflare.com":
+                return True
+
+        with suppress(Exception):
+            body = _safe_upper(await page.locator("body").text_content())
+            challenge_flags = [
+                "ONE MORE STEP",
+                "SECURITY CHECK",
+                "ENABLE JAVASCRIPT AND COOKIES",
+                "VERIFY YOU ARE HUMAN",
+                "VERIFICATION SUCCESSFUL. WAITING",
+            ]
+            if any(flag in body for flag in challenge_flags):
+                return True
+
+        with suppress(Exception):
+            return any(
+                (urlparse(frame.url).hostname or "").lower() == "challenges.cloudflare.com"
+                for frame in page.frames
+            )
+
+        return False
+
+    async def _wait_for_cloudflare_clearance(
+        self, page: Page, promotion: PromotionGame | None = None, timeout_ms: int = 45000
+    ) -> bool:
+        if not await self._is_cloudflare_challenge_page(page):
+            return True
+
+        logger.warning("Cloudflare challenge detected; waiting for clearance before continuing")
+        deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+        while asyncio.get_running_loop().time() < deadline:
+            await page.wait_for_timeout(2500)
+            if not await self._is_cloudflare_challenge_page(page):
+                logger.success("Cloudflare challenge cleared")
+                return True
+
+            if promotion is not None:
+                with suppress(Exception):
+                    if promotion.url.rstrip("/").split("/")[-1] not in page.url:
+                        await page.goto(promotion.url, wait_until="domcontentloaded", timeout=30000)
+
+        await self._dump_debug_snapshot(page, "cloudflare_challenge_timeout", promotion)
+        logger.warning("Cloudflare challenge did not clear within timeout")
+        return False
 
     @staticmethod
     async def _agree_license(page: Page):
@@ -512,7 +743,9 @@ class EpicGames:
                 await accept.click()
 
         with suppress(Exception):
-            accept = page.locator("//button[contains(., 'Accept') or contains(., '同意') or contains(., '接受')]")
+            accept = page.locator(
+                "//button[contains(., 'Accept') or contains(., '同意') or contains(., '接受')]"
+            )
             if await accept.first.is_visible(timeout=2000):
                 await accept.first.click(force=True)
 
@@ -536,7 +769,12 @@ class EpicGames:
                 return True
 
         with suppress(Exception):
-            accept = wpc.locator("button", has_text=re.compile(r"(confirm|place order|submit order|complete order|pay now)", re.I))
+            accept = wpc.locator(
+                "button",
+                has_text=re.compile(
+                    r"(confirm|place order|submit order|complete order|pay now)", re.I
+                ),
+            )
             if await accept.first.is_visible(timeout=5000):
                 await accept.first.click(force=True)
                 return True
@@ -587,7 +825,13 @@ class EpicGames:
 
     async def _has_checkout_iframe(self, page: Page) -> bool:
         with suppress(Exception):
-            return await page.locator(self.IFRAME_SELECTOR).first.is_visible(timeout=1500)
+            iframe = page.locator(self.IFRAME_SELECTOR)
+            if await iframe.count() > 0:
+                return True
+
+        with suppress(Exception):
+            return any("purchase" in frame.url or "checkout" in frame.url for frame in page.frames)
+
         return False
 
     async def _classify_flow(self, page: Page) -> str:
@@ -601,7 +845,9 @@ class EpicGames:
             has_free_claim_action=has_free_claim_action,
         )
 
-    async def _collect_button_candidates(self, scope, keywords: List[str], source: str) -> List[dict]:
+    async def _collect_button_candidates(
+        self, scope, keywords: List[str], source: str
+    ) -> List[dict]:
         selectors = [
             "button",
             "[role='button']",
@@ -636,7 +882,12 @@ class EpicGames:
                         enabled = await btn.is_enabled()
                     with suppress(Exception):
                         box = await btn.bounding_box()
-                        in_viewport = bool(box and box.get("width", 0) > 0 and box.get("height", 0) > 0)
+                        in_viewport = bool(
+                            box and box.get("width", 0) > 0 and box.get("height", 0) > 0
+                        )
+
+                    if self._has_negative_button_signal(text, aria or data_testid):
+                        continue
 
                     score = self._score_button_candidate(
                         text=text,
@@ -698,6 +949,8 @@ class EpicGames:
                       const dataTestid = (el.getAttribute("data-testid") || "").trim();
                       if (!text && !aria && !dataTestid) continue;
                       const full = `${text} ${aria} ${dataTestid}`.toUpperCase();
+                      const negative = ["COMING SOON", "WISHLIST", "NOTIFY ME", "UNAVAILABLE"];
+                      if (negative.some((w) => full.includes(w))) continue;
                       if (words.some((w) => full.includes(w.toUpperCase()))) {
                         out.push({
                           text,
@@ -738,7 +991,9 @@ class EpicGames:
         if not candidates:
             await page.wait_for_timeout(1200)
             try:
-                candidates.extend(await self._collect_button_candidates(page, keywords, "main_dom_wait"))
+                candidates.extend(
+                    await self._collect_button_candidates(page, keywords, "main_dom_wait")
+                )
             except Exception:
                 pass
 
@@ -798,10 +1053,7 @@ class EpicGames:
                 payload["body_sample"] = _clean_text(body)[:1200]
 
             with suppress(Exception):
-                payload["frames"] = [
-                    {"url": fr.url, "name": fr.name}
-                    for fr in page.frames[:20]
-                ]
+                payload["frames"] = [{"url": fr.url, "name": fr.name} for fr in page.frames[:20]]
 
             logger.debug(f"页面状态[{stage}]: {json.dumps(payload, ensure_ascii=False)}")
         except Exception as err:
@@ -848,6 +1100,10 @@ class EpicGames:
         return True
 
     async def _verify_claim_success(self, page: Page, promotion: PromotionGame) -> bool:
+        if await self._is_cloudflare_challenge_page(page):
+            logger.warning("页面仍处于 Cloudflare 验证中，不能作为领取成功")
+            return False
+
         if await self._is_claimed_on_product_page(page):
             return True
 
@@ -1022,6 +1278,20 @@ class EpicGames:
                 )
             )
 
+            btn_text = _clean_text(
+                f"{button.get('text', '')} {button.get('aria', '')} {button.get('data-testid', '')}"
+            )
+            if any(
+                flag in _safe_upper(btn_text)
+                for flag in ["IN LIBRARY", "OWNED", "已拥有", "已在库"]
+            ):
+                logger.info("Game already owned (verified by button text)")
+                return btn_text
+
+            if button.get("source") == "iframe":
+                logger.success("Purchase iframe is already active; handing off to checkout flow")
+                return _clean_text(f"{button.get('text', '')} {button.get('aria', '')}")
+
             if not locator:
                 logger.debug("按钮来自 shadow dom，尝试交给 free_claim_flow")
                 await self._handle_free_claim_flow(page)
@@ -1041,7 +1311,9 @@ class EpicGames:
                     logger.debug("Method: Coordinate click")
                     box = await locator.bounding_box()
                     if box:
-                        await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                        await page.mouse.click(
+                            box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+                        )
                     else:
                         logger.debug("坐标点击失败：bounding_box 为空")
                 elif method == "keyboard":
@@ -1059,7 +1331,9 @@ class EpicGames:
                 with suppress(Exception):
                     still_visible = await locator.is_visible()
                     if not still_visible:
-                        logger.success(f"Get button clicked successfully via {method} method (button disappeared)")
+                        logger.success(
+                            f"Get button clicked successfully via {method} method (button disappeared)"
+                        )
                         return _clean_text(f"{button.get('text', '')} {button.get('aria', '')}")
 
                 logger.warning(f"Method {method} executed but no state change detected")
@@ -1074,7 +1348,6 @@ class EpicGames:
             raise last_exception
         raise AssertionError("Could not find or click purchase entry button (Get/Free)")
 
-
     async def _handle_checkout_flow(self, page: Page):
         logger.info("🚀 Handling checkout flow...")
         self._ensure_page_alive("checkout_flow")
@@ -1084,17 +1357,33 @@ class EpicGames:
         if payment_btn is None:
             raise RuntimeError("结算页按钮未找到")
 
-        with suppress(Exception):
-            await payment_btn.scroll_into_view_if_needed()
-        await payment_btn.click(force=True)
-        await page.wait_for_timeout(2000)
-        await self._safe_wait_for_challenge(agent, page)
+        challenge_signal, cleanup_challenge_watcher = self._watch_hcaptcha_challenge(page)
+        try:
+            clicked = await self._click_locator_with_fallbacks(
+                payment_btn, page, "checkout_payment"
+            )
+            if not clicked:
+                logger.warning(
+                    "Checkout payment button click did not report success; checking challenge state"
+                )
+            await page.wait_for_timeout(2000)
+            await self._safe_wait_for_challenge(agent, page, challenge_signal)
+        finally:
+            cleanup_challenge_watcher()
 
         with suppress(Exception):
             await self._uk_confirm_order(wpc)
 
-        with suppress(Exception):
-            await payment_btn.click(force=True)
+        challenge_signal, cleanup_challenge_watcher = self._watch_hcaptcha_challenge(page)
+        try:
+            with suppress(Exception):
+                if await payment_btn.is_visible(timeout=2000) and await payment_btn.is_enabled():
+                    await self._click_locator_with_fallbacks(
+                        payment_btn, page, "checkout_payment_confirm"
+                    )
+            await self._safe_wait_for_challenge(agent, page, challenge_signal)
+        finally:
+            cleanup_challenge_watcher()
 
     async def _handle_free_claim_flow(self, page: Page):
         logger.info("🎁 Handling add-to-library flow...")
@@ -1103,7 +1392,9 @@ class EpicGames:
         await self._handle_content_gate(page)
 
         try:
-            await page.locator("[data-testid='purchase-cta-button']").first.wait_for(state="visible", timeout=12000)
+            await page.locator("[data-testid='purchase-cta-button']").first.wait_for(
+                state="visible", timeout=12000
+            )
         except Exception:
             logger.debug("Purchase button not visible after wait, proceeding with scan")
 
@@ -1126,33 +1417,39 @@ class EpicGames:
 
         if button["source"] == "shadow_dom":
             logger.debug("Button found in shadow DOM, falling back to JS click discovery")
-            with suppress(Exception):
-                await page.evaluate(
-                    """
-                    (words) => {
-                      const queue = [document];
-                      while (queue.length) {
-                        const root = queue.shift();
-                        const elements = root.querySelectorAll("button,[role='button'],[aria-label],a[role='button']");
-                        for (const el of elements) {
-                          const text = `${el.textContent || ""} ${el.getAttribute("aria-label") || ""} ${el.getAttribute("data-testid") || ""}`.toUpperCase();
-                          if (words.some((w) => text.includes(w.toUpperCase()))) {
-                            el.click();
-                            return true;
+            challenge_signal, cleanup_challenge_watcher = self._watch_hcaptcha_challenge(page)
+            try:
+                with suppress(Exception):
+                    await page.evaluate(
+                        """
+                        (words) => {
+                          const queue = [document];
+                          while (queue.length) {
+                            const root = queue.shift();
+                            const elements = root.querySelectorAll("button,[role='button'],[aria-label],a[role='button']");
+                            for (const el of elements) {
+                              const text = `${el.textContent || ""} ${el.getAttribute("aria-label") || ""} ${el.getAttribute("data-testid") || ""}`.toUpperCase();
+                              const negative = ["COMING SOON", "WISHLIST", "NOTIFY ME", "UNAVAILABLE"];
+                              if (negative.some((w) => text.includes(w))) continue;
+                              if (words.some((w) => text.includes(w.toUpperCase()))) {
+                                el.click();
+                                return true;
+                              }
+                            }
+                            const hosts = root.querySelectorAll("*");
+                            for (const host of hosts) {
+                              if (host.shadowRoot) queue.push(host.shadowRoot);
+                            }
                           }
+                          return false;
                         }
-                        const hosts = root.querySelectorAll("*");
-                        for (const host of hosts) {
-                          if (host.shadowRoot) queue.push(host.shadowRoot);
-                        }
-                      }
-                      return false;
-                    }
-                    """,
-                    self._compose_candidate_keywords(),
-                )
-            await page.wait_for_timeout(2000)
-            await self._safe_wait_for_challenge(agent, page)
+                        """,
+                        self._compose_candidate_keywords(),
+                    )
+                await page.wait_for_timeout(2000)
+                await self._safe_wait_for_challenge(agent, page, challenge_signal)
+            finally:
+                cleanup_challenge_watcher()
             return
 
         locator = button["locator"]
@@ -1161,9 +1458,13 @@ class EpicGames:
 
         await locator.scroll_into_view_if_needed()
         await page.wait_for_timeout(500)
-        await self._click_locator_with_fallbacks(locator, page, "purchase_entry")
-        await page.wait_for_timeout(2000)
-        await self._safe_wait_for_challenge(agent, page)
+        challenge_signal, cleanup_challenge_watcher = self._watch_hcaptcha_challenge(page)
+        try:
+            await self._click_locator_with_fallbacks(locator, page, "purchase_entry")
+            await page.wait_for_timeout(2000)
+            await self._safe_wait_for_challenge(agent, page, challenge_signal)
+        finally:
+            cleanup_challenge_watcher()
 
         # 点击后立刻记录状态，便于定位“点了但没反应”的原因
         await page.wait_for_timeout(1500)
@@ -1175,9 +1476,15 @@ class EpicGames:
                 alt_btn = page.locator("button[data-testid='purchase-cta-button']").first
                 if await alt_btn.is_visible(timeout=1000):
                     logger.debug("第一次点击后仍停留原页，尝试第二次点击 purchase-cta-button")
-                    await alt_btn.click(force=True)
-                    await page.wait_for_timeout(2000)
-                    await self._safe_wait_for_challenge(agent, page)
+                    challenge_signal, cleanup_challenge_watcher = self._watch_hcaptcha_challenge(
+                        page
+                    )
+                    try:
+                        await alt_btn.click(force=True)
+                        await page.wait_for_timeout(2000)
+                        await self._safe_wait_for_challenge(agent, page, challenge_signal)
+                    finally:
+                        cleanup_challenge_watcher()
 
     async def _find_active_purchase_container(self, page: Page):
         await page.locator(self.IFRAME_SELECTOR).first.wait_for(state="visible", timeout=20000)
@@ -1208,7 +1515,9 @@ class EpicGames:
         logger.debug("Scanning for purchase iframe...")
         return await self._find_active_purchase_container(page)
 
-    async def _process_single_promotion(self, page: Page, promotion: PromotionGame) -> tuple[bool, bool]:
+    async def _process_single_promotion(
+        self, page: Page, promotion: PromotionGame
+    ) -> tuple[bool, bool]:
         has_pending_cart_items = False
         result = {
             "title": promotion.title,
@@ -1228,6 +1537,7 @@ class EpicGames:
         for i in range(2):
             try:
                 await page.goto(promotion.url, wait_until="domcontentloaded", timeout=60000)
+                await self._wait_for_cloudflare_clearance(page, promotion)
                 load_ok = True
                 break
             except Exception as e:
@@ -1269,14 +1579,26 @@ class EpicGames:
                         await page.goto(promotion.url, wait_until="domcontentloaded", timeout=45000)
                 else:
                     await self._safe_reload(page)
+
+                with suppress(Exception):
+                    if promotion.url.rstrip("/").split("/")[-1] not in page.url:
+                        await page.goto(promotion.url, wait_until="domcontentloaded", timeout=45000)
                 await page.wait_for_timeout(3000)
 
+            await self._wait_for_cloudflare_clearance(page, promotion)
             await self._log_page_state(page, f"attempt_{attempt}_entry", promotion)
 
             with suppress(Exception):
-                continue_btn = page.locator("//button//span[normalize-space()='Continue' or normalize-space()='继续']")
+                continue_btn = page.locator(
+                    "//button//span[normalize-space()='Continue' or normalize-space()='继续']"
+                )
                 if await continue_btn.first.is_visible(timeout=1500):
                     await continue_btn.first.click()
+
+            with suppress(Exception):
+                await page.locator("[data-testid='purchase-cta-button']").first.wait_for(
+                    state="visible", timeout=8000
+                )
 
             if await self._is_claimed_on_product_page(page):
                 logger.info(f"已拥有/已入库，跳过点击: {promotion.title}")
@@ -1294,19 +1616,34 @@ class EpicGames:
             try:
                 entry_text = await self._click_entry_button(page)
                 logger.info(f"Entry button clicked: {entry_text}")
+                if any(
+                    flag in _safe_upper(entry_text)
+                    for flag in ["IN LIBRARY", "OWNED", "已拥有", "已在库"]
+                ):
+                    result["status"] = "already_owned"
+                    result["verified"] = True
+                    self._game_results.append(result)
+                    return True, False
             except Exception as err:
                 logger.warning(f"entry click failed {promotion.url=} err={err}")
-                await self._dump_debug_snapshot(page, f"entry_click_failed_{promotion.title}", promotion)
+                await self._dump_debug_snapshot(
+                    page, f"entry_click_failed_{promotion.title}", promotion
+                )
+                if await self._is_cloudflare_challenge_page(page):
+                    await self._wait_for_cloudflare_clearance(page, promotion)
+                    continue
                 if attempt <= 2:
                     try:
                         is_get_visible = await self._visual_verify_with_gemini(
                             page,
-                            "请判断页面中是否存在可点击的获取/领取/免费按钮，若存在仅回复 YES。"
+                            "请判断页面中是否存在可点击的获取/领取/免费按钮，若存在仅回复 YES。",
                         )
                         logger.info(f"视觉辅助判断结果: {is_get_visible}")
                         if is_get_visible:
                             with suppress(Exception):
-                                btn = page.locator("button[data-testid='purchase-cta-button']").first
+                                btn = page.locator(
+                                    "button[data-testid='purchase-cta-button']"
+                                ).first
                                 await btn.click(force=True)
                     except Exception as visual_err:
                         logger.debug(f"视觉兜底失败: {visual_err}")
@@ -1361,7 +1698,9 @@ class EpicGames:
 
             if attempt == 3:
                 logger.info("Trying 'Add to Cart' as last resort...")
-                add_cart_btn = await self._find_best_button(page, ["add to cart", "cart", "加入购物车"])
+                add_cart_btn = await self._find_best_button(
+                    page, ["add to cart", "cart", "加入购物车"]
+                )
                 if add_cart_btn and add_cart_btn.get("locator") is not None:
                     with suppress(Exception):
                         await add_cart_btn["locator"].click(force=True)
@@ -1373,7 +1712,9 @@ class EpicGames:
                             self._game_results.append(result)
                             return True, True
 
-            await self._dump_debug_snapshot(page, f"attempt_{attempt}_not_verified_{promotion.title}", promotion)
+            await self._dump_debug_snapshot(
+                page, f"attempt_{attempt}_not_verified_{promotion.title}", promotion
+            )
 
         result["status"] = "unverified_failed"
         self._game_results.append(result)
@@ -1394,7 +1735,9 @@ class EpicGames:
                 has_pending_cart_items = has_pending_cart_items or pending
             except Exception as err:
                 logger.warning(f"Failed to process promotion page - {promotion.url=} err={err}")
-                await self._dump_debug_snapshot(page, f"promotion_exception_{promotion.title}", promotion)
+                await self._dump_debug_snapshot(
+                    page, f"promotion_exception_{promotion.title}", promotion
+                )
                 with suppress(Exception):
                     await self._safe_reload(page)
                 self._game_results.append(
@@ -1445,8 +1788,12 @@ class EpicGames:
             logger.debug("Click payment button")
             if payment_btn is None:
                 raise RuntimeError("支付按钮不存在")
-            await payment_btn.click(force=True)
-            await self._safe_wait_for_challenge(agent, self.page)
+            challenge_signal, cleanup_challenge_watcher = self._watch_hcaptcha_challenge(self.page)
+            try:
+                await self._click_locator_with_fallbacks(payment_btn, self.page, "cart_payment")
+                await self._safe_wait_for_challenge(agent, self.page, challenge_signal)
+            finally:
+                cleanup_challenge_watcher()
             await self._uk_confirm_order(wpc)
             await self._safe_wait_for_challenge(agent, self.page)
         except Exception as err:
@@ -1469,9 +1816,13 @@ class EpicGames:
             except TimeoutError:
                 logger.warning("Failed to collect cart games")
         else:
-            logger.info("No cart items were accumulated; relying on direct claim verification only.")
+            logger.info(
+                "No cart items were accumulated; relying on direct claim verification only."
+            )
 
         verified_count = len([r for r in self._game_results if r.get("verified")])
         failed_count = len([r for r in self._game_results if not r.get("verified")])
-        logger.success(f"🎉 Process completed (verified={verified_count}, unverified={failed_count})")
+        logger.success(
+            f"🎉 Process completed (verified={verified_count}, unverified={failed_count})"
+        )
         logger.info(json.dumps(self._game_results, ensure_ascii=False))

@@ -13,7 +13,6 @@ using browser automation and scheduling capabilities.
 import asyncio
 import json
 import signal
-import sys
 from contextlib import suppress
 from datetime import datetime
 
@@ -42,7 +41,7 @@ init_log(
 TIMEZONE = timezone("Asia/Shanghai")
 
 
-@logger.catch
+@logger.catch(reraise=True)
 async def execute_browser_tasks(headless: bool = True):
     """
     Execute Epic Games free game collection tasks using browser automation.
@@ -64,6 +63,7 @@ async def execute_browser_tasks(headless: bool = True):
         record_video_size=ViewportSize(width=1920, height=1080),
         humanize=0.2,
         headless=headless,
+        ignore_https_errors=True,
     ) as browser:
         # Initialize or reuse existing browser page
         page = browser.pages[0] if browser.pages else await browser.new_page()
