@@ -375,6 +375,30 @@ class EpicGames:
         return out
 
     @staticmethod
+    def _has_negative_button_signal(text: str = "", aria_label: str = "") -> bool:
+        merged = _safe_upper(f"{text} {aria_label}")
+        negative_flags = [
+            "COMING SOON",
+            "UNAVAILABLE",
+            "ADD TO WISHLIST",
+            "WISHLIST",
+            "NOTIFY ME",
+            "FREE JUN",
+            "FREE JUL",
+            "FREE AUG",
+            "FREE SEP",
+            "FREE OCT",
+            "FREE NOV",
+            "FREE DEC",
+            "FREE JAN",
+            "FREE FEB",
+            "FREE MAR",
+            "FREE APR",
+            "FREE MAY",
+        ]
+        return any(flag in merged for flag in negative_flags)
+
+    @staticmethod
     def _score_button_candidate(
         text: str = "",
         aria_label: str = "",
@@ -391,6 +415,8 @@ class EpicGames:
             score += 50
         if keywords and any(word.upper() in aria_upper for word in keywords):
             score += 25
+        if EpicGames._has_negative_button_signal(text, aria_label):
+            score -= 100
         if visible:
             score += 20
         if enabled:
@@ -737,7 +763,13 @@ class EpicGames:
 
     async def _has_checkout_iframe(self, page: Page) -> bool:
         with suppress(Exception):
-            return await page.locator(self.IFRAME_SELECTOR).first.is_visible(timeout=1500)
+            iframe = page.locator(self.IFRAME_SELECTOR)
+            if await iframe.count() > 0:
+                return True
+
+        with suppress(Exception):
+            return any("purchase" in frame.url or "checkout" in frame.url for frame in page.frames)
+
         return False
 
     async def _classify_flow(self, page: Page) -> str:
@@ -791,6 +823,9 @@ class EpicGames:
                         in_viewport = bool(
                             box and box.get("width", 0) > 0 and box.get("height", 0) > 0
                         )
+
+                    if self._has_negative_button_signal(text, aria or data_testid):
+                        continue
 
                     score = self._score_button_candidate(
                         text=text,
@@ -852,6 +887,8 @@ class EpicGames:
                       const dataTestid = (el.getAttribute("data-testid") || "").trim();
                       if (!text && !aria && !dataTestid) continue;
                       const full = `${text} ${aria} ${dataTestid}`.toUpperCase();
+                      const negative = ["COMING SOON", "WISHLIST", "NOTIFY ME", "UNAVAILABLE"];
+                      if (negative.some((w) => full.includes(w))) continue;
                       if (words.some((w) => full.includes(w.toUpperCase()))) {
                         out.push({
                           text,
@@ -1175,6 +1212,10 @@ class EpicGames:
                 )
             )
 
+            if button.get("source") == "iframe":
+                logger.success("Purchase iframe is already active; handing off to checkout flow")
+                return _clean_text(f"{button.get('text', '')} {button.get('aria', '')}")
+
             if not locator:
                 logger.debug("按钮来自 shadow dom，尝试交给 free_claim_flow")
                 await self._handle_free_claim_flow(page)
@@ -1296,6 +1337,8 @@ class EpicGames:
                             const elements = root.querySelectorAll("button,[role='button'],[aria-label],a[role='button']");
                             for (const el of elements) {
                               const text = `${el.textContent || ""} ${el.getAttribute("aria-label") || ""} ${el.getAttribute("data-testid") || ""}`.toUpperCase();
+                              const negative = ["COMING SOON", "WISHLIST", "NOTIFY ME", "UNAVAILABLE"];
+                              if (negative.some((w) => text.includes(w))) continue;
                               if (words.some((w) => text.includes(w.toUpperCase()))) {
                                 el.click();
                                 return true;
@@ -1443,6 +1486,10 @@ class EpicGames:
                         await page.goto(promotion.url, wait_until="domcontentloaded", timeout=45000)
                 else:
                     await self._safe_reload(page)
+
+                with suppress(Exception):
+                    if promotion.url.rstrip("/").split("/")[-1] not in page.url:
+                        await page.goto(promotion.url, wait_until="domcontentloaded", timeout=45000)
                 await page.wait_for_timeout(3000)
 
             await self._log_page_state(page, f"attempt_{attempt}_entry", promotion)
