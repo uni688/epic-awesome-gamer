@@ -33,7 +33,9 @@ jobs:
           sudo apt-get install -y xvfb libxml2-dev libxslt-dev
 
       - name: Install dependencies
-        run: uv sync
+        run: |
+          uv sync
+          uv run playwright install-deps firefox
 
       # 增加 GITHUB_TOKEN 以解决 Camoufox 下载时的 403 频率限制
       - name: Install Camoufox
@@ -58,3 +60,17 @@ jobs:
         run: |
           echo "🚀 启动定时领取任务..."
           xvfb-run --auto-servernum --server-num=1 --server-args='-screen 0, 1920x1080x24' uv run app/deploy.py
+
+
+      - name: Upload runtime diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: epic-awesome-gamer-diagnostics-${{ github.run_id }}
+          path: |
+            app/volumes/logs/
+            app/volumes/runtime/
+            app/volumes/screenshots/
+            app/volumes/record/
+          if-no-files-found: ignore
+          retention-days: 7

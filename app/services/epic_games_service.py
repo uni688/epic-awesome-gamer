@@ -138,8 +138,8 @@ class EpicAgent:
         self._cookies = None
         self.epic_games = EpicGames(self.page, self.is_namespace_claimed)
 
-    async def _sync_order_history(self):
-        if self._orders:
+    async def _sync_order_history(self, force: bool = False):
+        if self._orders and not force:
             return
 
         completed_orders: List[OrderItem] = []
@@ -170,7 +170,7 @@ class EpicAgent:
         self._promotions = [p for p in get_promotions() if p.namespace not in self._namespaces]
 
     async def is_namespace_claimed(self, namespace: str) -> bool:
-        await self._sync_order_history()
+        await self._sync_order_history(force=True)
         namespaces = [order.namespace for order in self._orders]
         return namespace in namespaces
 
@@ -375,6 +375,30 @@ class EpicGames:
         return out
 
     @staticmethod
+    def _has_negative_button_signal(text: str = "", aria_label: str = "") -> bool:
+        merged = _safe_upper(f"{text} {aria_label}")
+        negative_flags = [
+            "COMING SOON",
+            "UNAVAILABLE",
+            "ADD TO WISHLIST",
+            "WISHLIST",
+            "NOTIFY ME",
+            "FREE JUN",
+            "FREE JUL",
+            "FREE AUG",
+            "FREE SEP",
+            "FREE OCT",
+            "FREE NOV",
+            "FREE DEC",
+            "FREE JAN",
+            "FREE FEB",
+            "FREE MAR",
+            "FREE APR",
+            "FREE MAY",
+        ]
+        return any(flag in merged for flag in negative_flags)
+
+    @staticmethod
     def _score_button_candidate(
         text: str = "",
         aria_label: str = "",
@@ -391,6 +415,8 @@ class EpicGames:
             score += 50
         if keywords and any(word.upper() in aria_upper for word in keywords):
             score += 25
+        if EpicGames._has_negative_button_signal(text, aria_label):
+            score -= 100
         if visible:
             score += 20
         if enabled:
@@ -421,12 +447,16 @@ class EpicGames:
             "OWNED",
             "THANK YOU",
             "ORDER COMPLETE",
+            "ORDER COMPLETED",
             "PURCHASE SUCCESSFUL",
-            "SUCCESS",
+            "PURCHASE COMPLETE",
             "ALREADY OWNED",
+            "ADDED TO YOUR LIBRARY",
             "已在库中",
             "已拥有",
             "领取成功",
+            "订单完成",
+            "购买成功",
         ]
         return any(flag.upper() in text_upper for flag in success_flags)
 
@@ -642,6 +672,58 @@ class EpicGames:
             logger.warning(f"Captcha handler isolated error: {err}")
 
     @staticmethod
+    async def _is_cloudflare_challenge_page(page: Page) -> bool:
+        with suppress(Exception):
+            title = _safe_upper(await page.title())
+            if "JUST A MOMENT" in title or "ATTENTION REQUIRED" in title:
+                return True
+
+        with suppress(Exception):
+            url = _safe_upper(page.url)
+            if "__CF_CHL" in url or "CHALLENGES.CLOUDFLARE.COM" in url:
+                return True
+
+        with suppress(Exception):
+            body = _safe_upper(await page.locator("body").text_content())
+            challenge_flags = [
+                "ONE MORE STEP",
+                "SECURITY CHECK",
+                "ENABLE JAVASCRIPT AND COOKIES",
+                "VERIFY YOU ARE HUMAN",
+                "VERIFICATION SUCCESSFUL. WAITING",
+            ]
+            if any(flag in body for flag in challenge_flags):
+                return True
+
+        with suppress(Exception):
+            return any("challenges.cloudflare.com" in frame.url for frame in page.frames)
+
+        return False
+
+    async def _wait_for_cloudflare_clearance(
+        self, page: Page, promotion: PromotionGame | None = None, timeout_ms: int = 45000
+    ) -> bool:
+        if not await self._is_cloudflare_challenge_page(page):
+            return True
+
+        logger.warning("Cloudflare challenge detected; waiting for clearance before continuing")
+        deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+        while asyncio.get_running_loop().time() < deadline:
+            await page.wait_for_timeout(2500)
+            if not await self._is_cloudflare_challenge_page(page):
+                logger.success("Cloudflare challenge cleared")
+                return True
+
+            if promotion is not None:
+                with suppress(Exception):
+                    if promotion.url.rstrip("/").split("/")[-1] not in page.url:
+                        await page.goto(promotion.url, wait_until="domcontentloaded", timeout=30000)
+
+        await self._dump_debug_snapshot(page, "cloudflare_challenge_timeout", promotion)
+        logger.warning("Cloudflare challenge did not clear within timeout")
+        return False
+
+    @staticmethod
     async def _agree_license(page: Page):
         logger.debug("Agree license")
         with suppress(Exception):
@@ -737,7 +819,13 @@ class EpicGames:
 
     async def _has_checkout_iframe(self, page: Page) -> bool:
         with suppress(Exception):
-            return await page.locator(self.IFRAME_SELECTOR).first.is_visible(timeout=1500)
+            iframe = page.locator(self.IFRAME_SELECTOR)
+            if await iframe.count() > 0:
+                return True
+
+        with suppress(Exception):
+            return any("purchase" in frame.url or "checkout" in frame.url for frame in page.frames)
+
         return False
 
     async def _classify_flow(self, page: Page) -> str:
@@ -791,6 +879,9 @@ class EpicGames:
                         in_viewport = bool(
                             box and box.get("width", 0) > 0 and box.get("height", 0) > 0
                         )
+
+                    if self._has_negative_button_signal(text, aria or data_testid):
+                        continue
 
                     score = self._score_button_candidate(
                         text=text,
@@ -852,6 +943,8 @@ class EpicGames:
                       const dataTestid = (el.getAttribute("data-testid") || "").trim();
                       if (!text && !aria && !dataTestid) continue;
                       const full = `${text} ${aria} ${dataTestid}`.toUpperCase();
+                      const negative = ["COMING SOON", "WISHLIST", "NOTIFY ME", "UNAVAILABLE"];
+                      if (negative.some((w) => full.includes(w))) continue;
                       if (words.some((w) => full.includes(w.toUpperCase()))) {
                         out.push({
                           text,
@@ -1001,6 +1094,10 @@ class EpicGames:
         return True
 
     async def _verify_claim_success(self, page: Page, promotion: PromotionGame) -> bool:
+        if await self._is_cloudflare_challenge_page(page):
+            logger.warning("页面仍处于 Cloudflare 验证中，不能作为领取成功")
+            return False
+
         if await self._is_claimed_on_product_page(page):
             return True
 
@@ -1175,6 +1272,20 @@ class EpicGames:
                 )
             )
 
+            btn_text = _clean_text(
+                f"{button.get('text', '')} {button.get('aria', '')} {button.get('data-testid', '')}"
+            )
+            if any(
+                flag in _safe_upper(btn_text)
+                for flag in ["IN LIBRARY", "OWNED", "已拥有", "已在库"]
+            ):
+                logger.info("Game already owned (verified by button text)")
+                return btn_text
+
+            if button.get("source") == "iframe":
+                logger.success("Purchase iframe is already active; handing off to checkout flow")
+                return _clean_text(f"{button.get('text', '')} {button.get('aria', '')}")
+
             if not locator:
                 logger.debug("按钮来自 shadow dom，尝试交给 free_claim_flow")
                 await self._handle_free_claim_flow(page)
@@ -1240,17 +1351,33 @@ class EpicGames:
         if payment_btn is None:
             raise RuntimeError("结算页按钮未找到")
 
-        with suppress(Exception):
-            await payment_btn.scroll_into_view_if_needed()
-        await payment_btn.click(force=True)
-        await page.wait_for_timeout(2000)
-        await self._safe_wait_for_challenge(agent, page)
+        challenge_signal, cleanup_challenge_watcher = self._watch_hcaptcha_challenge(page)
+        try:
+            clicked = await self._click_locator_with_fallbacks(
+                payment_btn, page, "checkout_payment"
+            )
+            if not clicked:
+                logger.warning(
+                    "Checkout payment button click did not report success; checking challenge state"
+                )
+            await page.wait_for_timeout(2000)
+            await self._safe_wait_for_challenge(agent, page, challenge_signal)
+        finally:
+            cleanup_challenge_watcher()
 
         with suppress(Exception):
             await self._uk_confirm_order(wpc)
 
-        with suppress(Exception):
-            await payment_btn.click(force=True)
+        challenge_signal, cleanup_challenge_watcher = self._watch_hcaptcha_challenge(page)
+        try:
+            with suppress(Exception):
+                if await payment_btn.is_visible(timeout=2000) and await payment_btn.is_enabled():
+                    await self._click_locator_with_fallbacks(
+                        payment_btn, page, "checkout_payment_confirm"
+                    )
+            await self._safe_wait_for_challenge(agent, page, challenge_signal)
+        finally:
+            cleanup_challenge_watcher()
 
     async def _handle_free_claim_flow(self, page: Page):
         logger.info("🎁 Handling add-to-library flow...")
@@ -1296,6 +1423,8 @@ class EpicGames:
                             const elements = root.querySelectorAll("button,[role='button'],[aria-label],a[role='button']");
                             for (const el of elements) {
                               const text = `${el.textContent || ""} ${el.getAttribute("aria-label") || ""} ${el.getAttribute("data-testid") || ""}`.toUpperCase();
+                              const negative = ["COMING SOON", "WISHLIST", "NOTIFY ME", "UNAVAILABLE"];
+                              if (negative.some((w) => text.includes(w))) continue;
                               if (words.some((w) => text.includes(w.toUpperCase()))) {
                                 el.click();
                                 return true;
@@ -1402,6 +1531,7 @@ class EpicGames:
         for i in range(2):
             try:
                 await page.goto(promotion.url, wait_until="domcontentloaded", timeout=60000)
+                await self._wait_for_cloudflare_clearance(page, promotion)
                 load_ok = True
                 break
             except Exception as e:
@@ -1443,8 +1573,13 @@ class EpicGames:
                         await page.goto(promotion.url, wait_until="domcontentloaded", timeout=45000)
                 else:
                     await self._safe_reload(page)
+
+                with suppress(Exception):
+                    if promotion.url.rstrip("/").split("/")[-1] not in page.url:
+                        await page.goto(promotion.url, wait_until="domcontentloaded", timeout=45000)
                 await page.wait_for_timeout(3000)
 
+            await self._wait_for_cloudflare_clearance(page, promotion)
             await self._log_page_state(page, f"attempt_{attempt}_entry", promotion)
 
             with suppress(Exception):
@@ -1453,6 +1588,11 @@ class EpicGames:
                 )
                 if await continue_btn.first.is_visible(timeout=1500):
                     await continue_btn.first.click()
+
+            with suppress(Exception):
+                await page.locator("[data-testid='purchase-cta-button']").first.wait_for(
+                    state="visible", timeout=8000
+                )
 
             if await self._is_claimed_on_product_page(page):
                 logger.info(f"已拥有/已入库，跳过点击: {promotion.title}")
@@ -1470,11 +1610,22 @@ class EpicGames:
             try:
                 entry_text = await self._click_entry_button(page)
                 logger.info(f"Entry button clicked: {entry_text}")
+                if any(
+                    flag in _safe_upper(entry_text)
+                    for flag in ["IN LIBRARY", "OWNED", "已拥有", "已在库"]
+                ):
+                    result["status"] = "already_owned"
+                    result["verified"] = True
+                    self._game_results.append(result)
+                    return True, False
             except Exception as err:
                 logger.warning(f"entry click failed {promotion.url=} err={err}")
                 await self._dump_debug_snapshot(
                     page, f"entry_click_failed_{promotion.title}", promotion
                 )
+                if await self._is_cloudflare_challenge_page(page):
+                    await self._wait_for_cloudflare_clearance(page, promotion)
+                    continue
                 if attempt <= 2:
                     try:
                         is_get_visible = await self._visual_verify_with_gemini(
@@ -1631,8 +1782,12 @@ class EpicGames:
             logger.debug("Click payment button")
             if payment_btn is None:
                 raise RuntimeError("支付按钮不存在")
-            await payment_btn.click(force=True)
-            await self._safe_wait_for_challenge(agent, self.page)
+            challenge_signal, cleanup_challenge_watcher = self._watch_hcaptcha_challenge(self.page)
+            try:
+                await self._click_locator_with_fallbacks(payment_btn, self.page, "cart_payment")
+                await self._safe_wait_for_challenge(agent, self.page, challenge_signal)
+            finally:
+                cleanup_challenge_watcher()
             await self._uk_confirm_order(wpc)
             await self._safe_wait_for_challenge(agent, self.page)
         except Exception as err:

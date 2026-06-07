@@ -90,6 +90,35 @@ def test_verify_claim_success_uses_order_history_fallback():
     asyncio.run(_runner())
 
 
+def test_success_text_does_not_match_generic_cloudflare_success():
+    assert not EpicGames._has_success_text(
+        "Verification successful. Waiting for store.epicgames.com to respond"
+    )
+    assert EpicGames._has_success_text("Order complete - thank you")
+
+
+class FakeCloudflarePage:
+    url = "https://store.epicgames.com/p/game?__cf_chl_rt_tk=token"
+    frames = []
+
+    async def title(self):
+        return "Just a moment..."
+
+    def locator(self, selector: str):
+        return FakeLocator(
+            text="One more step Please complete a security check to continue", visible=True
+        )
+
+
+def test_verify_claim_success_rejects_cloudflare_success_text():
+    async def _runner():
+        game = EpicGames(page=FakeCloudflarePage())
+        promotion = SimpleNamespace(namespace="ns")
+        assert await game._verify_claim_success(FakeCloudflarePage(), promotion) is False
+
+    asyncio.run(_runner())
+
+
 class FakeHiddenLocator(FakeLocator):
     async def is_visible(self, timeout=None):
         return False
