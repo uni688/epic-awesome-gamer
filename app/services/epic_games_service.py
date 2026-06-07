@@ -14,6 +14,7 @@ from datetime import datetime
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, Awaitable, Callable, List, Optional
+from urllib.parse import urlparse
 
 import httpx
 from hcaptcha_challenger.agent import AgentV
@@ -679,8 +680,10 @@ class EpicGames:
                 return True
 
         with suppress(Exception):
-            url = _safe_upper(page.url)
-            if "__CF_CHL" in url or "CHALLENGES.CLOUDFLARE.COM" in url:
+            raw_url = page.url
+            url = _safe_upper(raw_url)
+            host = (urlparse(raw_url).hostname or "").lower()
+            if "__CF_CHL" in url or host == "challenges.cloudflare.com":
                 return True
 
         with suppress(Exception):
