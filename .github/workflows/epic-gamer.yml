@@ -6,6 +6,9 @@ on:
     # 每天 UTC 08:00 (北京时间 16:00) 运行一次
     - cron: '0 8 * * *'
 
+permissions:
+  contents: read
+
 jobs:
   epic-gamer:
     runs-on: ubuntu-latest
